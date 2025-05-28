@@ -1,0 +1,13 @@
+- name: Install and start Apache Tomcat
+  hosts: your_target_host
+  become: yes
+  tasks:
+    - name: Install Apache Tomcat
+      apt:
+        name: tomcat
+        state: present
+
+    - name: Start Apache Tomcat
+      service:
+        name: tomcat
+        state: started
