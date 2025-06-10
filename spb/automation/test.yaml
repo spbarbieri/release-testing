@@ -1,0 +1,44 @@
+- name: Install Apache Tomcat
+  hosts: your_target_host
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Download Apache Tomcat package
+      get_url:
+        url: https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.56/bin/apache-tomcat-9.0.56.tar.gz
+        dest: /tmp/apache-tomcat-9.0.56.tar.gz
+
+    - name: Extract Apache Tomcat package
+      unarchive:
+        src: /tmp/apache-tomcat-9.0.56.tar.gz
+        dest: /opt
+        owner: tomcat
+        group: tomcat
+        remote_src: yes
+
+    - name: Create symbolic link for Tomcat
+      file:
+        src: /opt/apache-tomcat-9.0.56
+        dest: /opt/tomcat
+        owner: tomcat
+        group: tomcat
+        state: link
+
+    - name: Configure Tomcat service
+      template:
+        src: templates/tomcat.service.j2
+        dest: /etc/systemd/system/tomcat.service
+      notify:
+        - restart tomcat
+
+    - name: Start Tomcat service
+      systemd:
+        name: tomcat
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: restart tomcat
+      systemd:
+        name: tomcat
+        state: restarted
