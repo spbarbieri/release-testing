@@ -1,0 +1,11 @@
+#!/bin/bash
+# Define the network device interface
+INTERFACE="eth0"
+
+# Function to check for bad segments
+check_bad_segments() {
+    # Use tcpdump to capture network traffic on the specified interface
+    # Filter for ICMP packets (type 8 for echo request and type 0 for echo reply)
+    # Exclude packets with a correct checksum (indicated by 'chksum == 0')
+    # Print the captured packets that fail the checksum check
+    tcpdump -i $INTERFACE -nn -vv -c 100 'icmp and icmp[icmptype] == icmp-echo and icmp[icmptype] != 0 and (icmp[icmptype] or icmp[icmptype] == 0) and (ip[ipproto] == icmp or ip[ipproto] == 6) and (ip[ipproto] != 2 and ip[ipproto] != 4) and (ip[ipproto] != 0) and (ip[ipproto] != 1) and (ip[ipproto] != 3) and (ip[ipproto] != 5) and (ip[ipproto] != 7) and (ip[ipproto] != 8) and (ip[ipproto] != 9) and (ip[ipproto] != 10) and (ip[ipproto] != 11) and (ip[ipproto] != 12) and (ip[ipproto] != 13) and (ip[ipproto] != 14) and (ip[ipproto] != 15) and (ip[ipproto] != 16) and (ip[ipproto] != 17) and (ip[ipproto] != 18) and (ip[ipproto] != 19) and (ip[ipproto] != 20) and (ip[ipproto] != 21) and (ip[ipproto] != 22) and (ip[ipproto] != 23) and (ip[ipproto] != 24) and (ip[ipproto] != 25) and (ip[ipproto] != 26) and (ip[ipproto] != 27) and (ip[ipproto] != 28) and (ip[ipproto] != 29) and (ip[ipproto] != 30) and (ip[ipproto] != 31) and (ip[ipproto] != 32) and (ip[ipproto] != 33) and (ip[ipproto] != 34) and (ip[ipproto] != 35) and (ip[ipproto] != 36) and (ip[ipproto] != 37) and (ip[ipproto] != 38) and (ip[ipproto] != 39) and (ip[ipproto] != 40) and (ip[ipproto] != 41) and (ip[ipproto] != 42) and (ip[ipproto] != 43) and (ip[ipproto] != 44) and (ip[ipproto] != 45) and (ip[ipproto] != 46) and (ip[ipproto] != 47) and (ip[ipproto] != 48) and (ip[ipproto] != 49) and (ip[ipproto] != 50) and (ip[ipproto] != 51) and (ip[ipproto] != 52) and (ip[ipproto] != 53) and (ip[ipproto] != 54) and (ip[ipproto] != 55) and (ip[ipproto] != 56) and (ip[ipproto] != 57) and (ip[ipproto] != 58) and (ip[ipproto] != 59) and (ip[ipproto] != 60) and (ip[ipproto] != 61) and (ip[ipproto] != 62) and (ip[ipproto] != 63) and (ip[ipproto] != 64) and (ip[ipproto] != 65) and (ip[ipproto] != 66) and (ip[ipproto] != 67) and (ip[ipproto] != 68) and (ip[ipproto] != 69) and (ip[ipproto] != 70) and (ip[ipproto] != 71) and (ip[ipproto
