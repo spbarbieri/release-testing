@@ -1,0 +1,32 @@
+#!/bin/bash
+# This script assumes that data is collected in a directory named 'data_collection'
+# and each file represents a single data point.
+
+# Navigate to the directory containing the collected data
+cd data_collection
+
+# Initialize an empty array to store potential issues
+declare -a potential_issues
+
+# Loop through each file in the directory
+for file in *; do
+    # Check if the file exists and is readable
+    if [ -r "$file" ]; then
+        # Use grep to search for patterns indicating potential issues
+        # The pattern 'error|fail|warning' is used as an example; adjust as needed
+        if grep -q "error|fail|warning" "$file"; then
+            # If a potential issue is found, add the filename to the array
+            potential_issues+=("$file")
+        fi
+    fi
+done
+
+# If there are potential issues, print them out
+if [ ${#potential_issues[@]} -gt 0 ]; then
+    echo "Potential issues identified in the following files:"
+    for issue in "${potential_issues[@]}"; do
+        echo "$issue"
+    done
+else
+    echo "No potential issues found in the collected data."
+fi
