@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Check if there are any pods in the deployment
+if kubectl get pods -n <namespace> | grep -q "0/1"; then
+  echo "No pods found in the deployment"
+  exit 1
+fi
+
+# Check for errors in pods
+errors=$(kubectl get pods -n <namespace> -o json | jq -r '.items[] | select(.status.containerStatuses[].ready == false) | .metadata.name')
+
+# If there are errors, restart the deployment
+if [ -n "$errors" ]; then
+  echo "Restarting deployment due to errors in pods: $errors"
+  kubectl rollout restart deployment/<deployment-name> -n <namespace>
+else
+  echo "No errors found in pods"
+fi
