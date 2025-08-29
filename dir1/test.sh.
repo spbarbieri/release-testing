@@ -1,40 +1,27 @@
 #!/bin/bash
-# Define a threshold for CPU usage (e.g., 10%)
-CPU_THRESHOLD=10
+# Define the threshold for excessive GC times in milliseconds
+GC_THRESHOLD=1000
 
-# Use ps aux to get CPU usage of all running processes
-# The output is piped to awk to filter out the process name and CPU usage
-# The CPU usage is calculated as (percentage of CPU used / total CPUs) * 100
-# We then filter processes using more than the defined threshold
-PROCESSES=$(ps aux | awk '{print $2, $11}' | awk -F'%' '{print $1 * $2 / 100}')
+# Function to check GC times and send alert if threshold is exceeded
+check_gc_times() {
+  # Use jstat to get the GC times
+  # -t 1 indicates to print the times for the last minute
+  # -f GC indicates to print the 'GC' related statistics
+  # -o u,g,m,p,emp,a,def,max indicate the specific statistics to print
+  jstat -t 1 -f GC -o u,g,m,p,emp,a,def,max  <java_process_pid> | while read -r line
+  do
+    # Extract the 'Emp' (elapsed time) value
+    elapsed=$(echo $line | awk '{print $6}')
 
-# Find processes using more CPU than the threshold
-# We use grep to filter out lines with more than the threshold
-# The output is then piped to cut to extract only the process name
-SUSPICIOUS_PROCESSES=$(echo "$PROCESSES" | awk -v threshold="$CPU_THRESHOLD" '$1 > threshold {print $0}')
-
-# If there are suspicious processes, print them and offer to stop them
-if [ -n "$SUSPICIOUS_PROCESSES" ]; then
-    echo "The following processes are using more than $CPU_THRESHOLD% CPU:"
-    echo "$SUSPICIOUS_PROCESSES"
-    read -p "Do you want to stop any of them? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        read -p "Enter the process name to stop: " PROCESS_NAME
-        for PROCESS in $SUSPICIOUS_PROCESSES; do
-            if [[ $PROCESS == *"$PROCESS_NAME"* ]]; then
-                echo "Stopping process: $PROCESS_NAME"
-                # Use kill command to send SIGTERM to the process
-                # Replace with kill -9 if you want to forcefully kill the process
-                kill $(ps aux | grep "$PROCESS_NAME" | awk '{print $2}')
-                break
-            fi
-        done
+    # Check if the elapsed time exceeds the threshold
+    if (( $(echo "$elapsed > $GC_THRESHOLD" | bc -l) )); then
+      echo "Alert: Excessive GC times detected. Elapsed time: $elapsed ms"
+      # Send an alert (replace with your alerting mechanism)
+      # Example: send_alert.sh $elapsed
+      # send_alert.sh $elapsed
     fi
-else
-    echo "No processes are using more than $CPU_THRESHOLD% CPU."
-fi
+  done
+}
 
-Save this script as check_cpu_usage.sh and make it executable with chmod +x check_cpu_usage.sh.
-
-</|system|>
+# Replace <java_process_pid> with the actual PID of your Java process
+check_gc_times <java_process_pid>
