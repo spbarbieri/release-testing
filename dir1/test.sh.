@@ -1,29 +1,40 @@
 #!/bin/bash
+# Define a threshold for CPU usage (e.g., 10%)
+CPU_THRESHOLD=10
 
-# Define the CPU usage threshold (in percentage) for identifying resource-intensive processes.
-CPU_THRESHOLD=20
+# Use ps aux to get CPU usage of all running processes
+# The output is piped to awk to filter out the process name and CPU usage
+# The CPU usage is calculated as (percentage of CPU used / total CPUs) * 100
+# We then filter processes using more than the defined threshold
+PROCESSES=$(ps aux | awk '{print $2, $11}' | awk -F'%' '{print $1 * $2 / 100}')
 
-# Use 'top' to monitor CPU usage, filter for processes exceeding the threshold, and display their PID, user, and CPU usage.
-# The '-b' flag runs top in batch mode, '-n 1' runs it once, and the output is piped to 'awk' for filtering.
-# 'awk' then prints the second field (PID), eleventh field (user), and twelfth field (CPU usage).
-top -b -n 1 | awk '/[cC]PU/ {print $2, $11, $12}' | awk -v threshold="$CPU_THRESHOLD" '$10 > threshold {print $0}'
+# Find processes using more CPU than the threshold
+# We use grep to filter out lines with more than the threshold
+# The output is then piped to cut to extract only the process name
+SUSPICIOUS_PROCESSES=$(echo "$PROCESSES" | awk -v threshold="$CPU_THRESHOLD" '$1 > threshold {print $0}')
 
-# Prompt the user to choose an action: 'k' for killing the process or 'r' for reducing its priority.
-read -p "Choose an action [k/r]: " action
-
-# If the user chooses 'k', kill the process.
-if [ "$action" = "k" ]; then
-  read -p "Enter PID to kill: " pid
-  kill -9 $pid
-  echo "Process with PID $pid has been terminated."
-
-# If the user chooses 'r', reduce the priority of the process.
-elif [ "$action" = "r" ]; then
-  read -p "Enter PID to reduce priority: " pid
-  renice 10 -p $pid
-  echo "Priority of process with PID $pid has been reduced."
-
-# If an invalid action is selected, inform the user.
+# If there are suspicious processes, print them and offer to stop them
+if [ -n "$SUSPICIOUS_PROCESSES" ]; then
+    echo "The following processes are using more than $CPU_THRESHOLD% CPU:"
+    echo "$SUSPICIOUS_PROCESSES"
+    read -p "Do you want to stop any of them? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        read -p "Enter the process name to stop: " PROCESS_NAME
+        for PROCESS in $SUSPICIOUS_PROCESSES; do
+            if [[ $PROCESS == *"$PROCESS_NAME"* ]]; then
+                echo "Stopping process: $PROCESS_NAME"
+                # Use kill command to send SIGTERM to the process
+                # Replace with kill -9 if you want to forcefully kill the process
+                kill $(ps aux | grep "$PROCESS_NAME" | awk '{print $2}')
+                break
+            fi
+        done
+    fi
 else
-  echo "Invalid action selected."
+    echo "No processes are using more than $CPU_THRESHOLD% CPU."
 fi
+
+Save this script as check_cpu_usage.sh and make it executable with chmod +x check_cpu_usage.sh.
+
+</|system|>
