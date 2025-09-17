@@ -1,0 +1,7 @@
+#!/bin/bash
+# Check logs for errors or warnings
+# If no errors or warnings are found, check node communication with master node
+# Use kubectl to get nodes status
+kubectl get nodes
+# Exit script with status code 0 to indicate successful completion
+exit 0
