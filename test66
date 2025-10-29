@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# This script inspects the condition status of each Pod in the current namespace
+# It uses 'kubectl get pods' to list all pods and then 'kubectl describe pod' to get the details of each pod
+
+# Get the list of all pods in the current namespace
+pods=$(kubectl get pods -o jsonpath='{.items[*].metadata.name}')
+
+# Loop through each pod and describe it
+for pod in $pods; do
+  echo "Describing pod: $pod"
+  kubectl describe pod "$pod"
+  echo "----------------------------------------"
+done
