@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Check for error messages or warnings in the logs
+if ! grep -q -E "error|warning" /var/log/syslog; then
+    # If no errors or warnings, check node communication with master
+    echo "No errors or warnings found in logs. Checking node communication..."
+    kubectl get nodes
+else
+    echo "Errors or warnings found in logs. Please investigate."
+fi
