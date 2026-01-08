@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# This script identifies the Service Level Objective (SLO) associated with an alert.
+# It assumes that the alert details are available in a JSON file named 'alert.json'.
+# The script extracts the SLO from the alert details and prints it.
+
+# Check if the alert.json file exists
+if [ ! -f "alert.json" ]; then
+    echo "Error: alert.json file not found."
+    exit 1
+fi
+
+# Extract the SLO from the alert details
+SLO=$(jq -r '.slo' alert.json)
+
+# Check if the SLO was successfully extracted
+if [ -z "$SLO" ]; then
+    echo "Error: SLO not found in alert details."
+    exit 1
+fi
+
+# Print the SLO
+echo "The Service Level Objective (SLO) associated with this alert is: $SLO"
