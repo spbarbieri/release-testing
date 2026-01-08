@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# This script lists all pods in the namespace with their statuses, node names, and restart counts
+# It helps identify pods that are not ready or available due to crashes, scheduling issues, or resource constraints
+
+kubectl get pods -o wide
