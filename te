@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Define the log file path and the time range to analyze
+LOG_FILE="/var/log/application.log"
+START_TIME="2023-10-01 00:00:00"
+END_TIME="2023-10-01 23:59:59"
+
+# Convert the time range to timestamps for easier comparison
+START_TIMESTAMP=$(date -d "$START_TIME" +%s)
+END_TIMESTAMP=$(date -d "$END_TIME" +%s)
+
+# Analyze the log file within the specified time range
+echo "Analyzing $LOG_FILE between $START_TIME and $END_TIME..."
+echo "--------------------------------------------------"
+
+# Use awk to filter and analyze the log entries
+awk -v start="$START_TIMESTAMP" -v end="$END_TIMESTAMP" '
+{
+    # Extract the timestamp from the log entry (assuming the timestamp is the first field)
+    log_time = $1 " " $2
+    timestamp = mktime(log_time)
+
+    # Check if the log entry falls within the specified time range
+    if (timestamp >= start && timestamp <= end) {
+        # Print the log entry
+        print $0
+
+        # Count the occurrences of each error message
+        error_msg = $0
+        error_count[error_msg]++
+    }
+}
+END {
+    # Print the error message counts
+    print "--------------------------------------------------"
+    print "Error Message Counts:"
+    print "--------------------------------------------------"
+    for (msg in error_count) {
+        print error_count[msg] " occurrences of: " msg
+    }
+}' "$LOG_FILE"
