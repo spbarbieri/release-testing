@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# This script analyzes the Redis slow log to identify slow queries.
+# It connects to the Redis server, retrieves the slow log, and processes it to find queries that exceed a specified threshold.
+
+# Configuration
+REDIS_HOST="localhost"  # Redis server host
+REDIS_PORT=6379         # Redis server port
+SLOWLOG_THRESHOLD=10000 # Threshold in microseconds (10ms) to consider a query as slow
+SLOWLOG_LENGTH=128      # Number of slow log entries to retrieve
+
+# Connect to Redis and retrieve the slow log
+slow_log=$(redis-cli -h $REDIS_HOST -p $REDIS_PORT --slowlog get $SLOWLOG_LENGTH)
+
+# Process the slow log
+echo "Analyzing Redis slow log..."
+echo "Slow queries (threshold: $SLOWLOG_THRESHOLD microseconds):"
+echo "---------------------------------------------------------"
+
+# Loop through each slow log entry
+while read -r line; do
+  # Extract the execution time and command from the slow log entry
+  if [[ $line =~ ^[0-9]+\)\ 1\)\ \"([^\"]+)\"\ 2\)\ \"([^\"]+)\"\ 3\)\ \"([^\"]+)\"\ 4\)\ \"([^\"]+)\" ]]; then
+    id=${BASH_REMATCH[1]}
+    timestamp=${BASH_REMATCH[2]}
+    execution_time=${BASH_REMATCH[3]}
+    command=${BASH_REMATCH[4]}
+
+    # Check if the execution time exceeds the threshold
+    if [ $execution_time -gt $SLOWLOG_THRESHOLD ]; then
+      echo "ID: $id"
+      echo "Timestamp: $timestamp"
+      echo "Execution Time: $execution_time microseconds"
+      echo "Command: $command"
+      echo "---------------------------------------------------------"
+    fi
+  fi
+done <<< "$slow_log"
+
+echo "Analysis complete."
