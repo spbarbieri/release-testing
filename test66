@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Check system metrics using top
+echo "Checking system metrics..."
+top -b -n 1 | head -n 12
+
+# Review application server logs for excessive function invocations
+echo "Reviewing application server logs..."
+grep -i "system.out.println" /var/log/application.log
+
+# Utilize profiling tools (JProfiler or VisualVM)
+echo "Utilizing profiling tools..."
+echo "Please manually run JProfiler or VisualVM for detailed profiling."
+
+# Monitor thread activity using jstack
+echo "Monitoring thread activity..."
+jps
+echo "Please manually run jstack <jvm_pid> to generate a thread dump."
+
+# Identify blocking I/O operations using Java Mission Control
+echo "Identifying blocking I/O operations..."
+echo "Please manually run Java Mission Control for detailed I/O analysis."
+
+# Investigate recent changes
+echo "Investigating recent changes..."
+git log --since="1 day ago" --oneline
