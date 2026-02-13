@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# Verify SAP Java NetWeaver service status
+echo "Checking SAP Java NetWeaver service status..."
+service sapstartsrv status -all
+
+# Check network connectivity to SAP host
+echo "Pinging SAP hostname..."
+ping -c 4 <sap_hostname>
+
+# Validate firewall rules
+echo "Checking firewall rules..."
+firewall-cmd --list-all
+
+# Review instance logs for errors
+echo "Reviewing instance logs..."
+log_path="tmpidiagnav/TESTSAP/<AS_Java_Instance>/exp/<timestamp>/inst.log"
+if [ -f "$log_path" ]; then
+    echo "Log file found. Displaying recent errors..."
+    grep -i "error\|refused\|failed" "$log_path" | tail -n 20
+else
+    echo "Log file not found at $log_path"
+fi
+
+# Perform manual troubleshooting based on log findings
+echo "Performing manual troubleshooting..."
+# Example: Restart service if needed
+# systemctl start <service_name>
+
+# Check disk space
+echo "Checking disk space..."
+df -h
+
+# Analyze memory usage
+echo "Analyzing memory usage..."
+free -h
+
+# Cross-verify configurations (placeholder for actual checks)
+echo "Cross-verifying configurations..."
+# Add specific configuration checks here
