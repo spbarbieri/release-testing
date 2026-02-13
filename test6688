@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Define variables
+HOSTNAME="your_hostname"  # Replace with actual hostname
+SERVICE_PORT="your_port"  # Replace with actual service port
+SAP_HOME="/path/to/sap-home"  # Replace with actual SAP home path
+SID="your_sid"  # Replace with actual SAP system ID
+CLUSTER_NODE="your_cluster_node"  # Replace with actual cluster node name
+
+# 1. Verify if ServiceHost is up with telnet
+echo "Checking if ServiceHost is up..."
+if ! timeout 1 telnet "$HOSTNAME" "$SERVICE_PORT" &>/dev/null; then
+    echo "ServiceHost is down or unreachable on port $SERVICE_PORT"
+    exit 1
+else
+    echo "ServiceHost is up"
+fi
+
+# 2. Examine service dependency status using 'dasd sUh'
+echo "Checking service dependency status..."
+dasd sUh
+
+# 3. Review logs for explicit error messages
+echo "Reviewing logs for error messages..."
+grep -i "error\|fail\|refuse" "$SAP_HOME/instdir/logs/"*
+
+# 4. Analyze machine resource consumption
+echo "Analyzing machine resource consumption..."
+top -b -n 1
+vmstat 1 5
+iostat -x 1 5
+
+# 5. Ensure SAP service manager and related services are running
+echo "Checking SAP service manager status..."
+systemctl status "sapservice$SID"
+
+# 6. Startup the SAP Java system (use with caution)
+echo "Starting SAP Java system..."
+./"BW_J2EE_$CLUSTER_NODE/sys/batch/startjwmainSAP"
+
+# Note: Permanent resolution requires analyzing the root cause identified by log verification.
