@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# This script helps diagnose and troubleshoot Kubernetes deployment issues
+# It performs a series of checks and actions to identify and potentially resolve deployment problems
+
+# Check if kubectl is installed
+if ! command -v kubectl &> /dev/null; then
+    echo "kubectl is not installed. Please install kubectl and try again."
+    exit 1
+fi
+
+# Check if deployment name is provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <deployment_name> [namespace]"
+    exit 1
+fi
+
+DEPLOYMENT_NAME=$1
+NAMESPACE=${2:-default}  # Default to 'default' namespace if not provided
+
+# 1. Describe the deployment to check health and status
+echo "=== Deployment Description ==="
+kubectl describe deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE"
+
+# 2. Check scheduler events and pod details
+echo -e "\n=== Scheduler Events ==="
+kubectl get events -n "$NAMESPACE" --sort-by='.metadata.creationTimestamp'
+
+# Get pod names for the deployment
+PODS=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$DEPLOYMENT_NAME" --no-headers -o custom-columns=":metadata.name")
+
+if [ -n "$PODS" ]; then
+    echo -e "\n=== Pod Descriptions ==="
+    for POD in $PODS; do
+        echo -e "\n--- Pod: $POD ---"
+        kubectl describe pod "$POD" -n "$NAMESPACE"
+    done
+else
+    echo -e "\nNo pods found for deployment $DEPLOYMENT_NAME in namespace $NAMESPACE"
+fi
+
+# 3. Check node status
+echo -e "\n=== Node Status ==="
+kubectl get nodes
+
+# Check for any nodes that are not ready
+UNREADY_NODES=$(kubectl get nodes | grep -v " Ready " | awk '{print $1}')
+
+if [ -n "$UNREADY_NODES" ]; then
+    echo -e "\n=== Unready Nodes ==="
+    for NODE in $UNREADY_NODES; do
+        echo -e "\n--- Node: $NODE ---"
+        kubectl describe node "$NODE"
+    done
+fi
+
+# 4. Check resource constraints
+echo -e "\n=== Resource Constraints ==="
+kubectl describe deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" | grep -A 10 "Conditions"
+
+# Check for ResourceQuota errors
+echo -e "\n=== ResourceQuota Status ==="
+kubectl get resourcequota -n "$NAMESPACE"
+
+# 5. Perform a rolling update
+echo -e "\n=== Performing Rolling Update ==="
+kubectl rollout restart deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE"
+
+# Monitor the rollout status
+echo -e "\n=== Monitoring Rollout Status ==="
+kubectl rollout status deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE"
+
+# 6. If needed, adjust replica count (commented out by default)
+# echo -e "\n=== Adjusting Replica Count ==="
+# kubectl patch deployment "$DEPLOYMENT_NAME" -n "$NAMESPACE" -p '{"spec":{"replicas": 1}}'
+# kubectl rollout status deployment/"$DEPLOYMENT_NAME" -n "$NAMESPACE"
+
+echo -e "\nDiagnostic complete. Review the output above for any issues."
