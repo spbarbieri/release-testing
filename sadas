@@ -1,0 +1,114 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: diagnose_k8s_node.sh
+# Purpose: Diagnose common issues on a Kubernetes worker node.
+# Steps:
+#   1. Scan kubelet logs for errors or warnings.
+#   2. Verify node appears in `kubectl get nodes`.
+#   3. If absent, confirm the node has an IP address.
+#   4. If present but in a bad condition, restart kubelet.
+# ------------------------------------------------------------
+
+#--- Configuration -------------------------------------------------
+# Time window for log inspection (e.g., last 30 minutes)
+LOG_SINCE="30m"
+# Log source – using journalctl for the kubelet service
+KUBELET_JOURNAL_CMD=(journalctl -u kubelet --since "$LOG_SINCE")
+# Pattern to search for (case‑insensitive)
+LOG_PATTERN='(?i)(error|warning)'
+# Minimum required utilities
+REQUIRED_CMDS=("kubectl" "journalctl" "systemctl" "ip" "hostname")
+
+#--- Helper Functions ----------------------------------------------
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+check_requirements() {
+    for cmd in "${REQUIRED_CMDS[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Required command '$cmd' not found in PATH."
+    done
+}
+
+has_errors_in_logs() {
+    # Returns 0 if errors/warnings are found, 1 otherwise
+    if "${KUBELET_JOURNAL_CMD[@]}" | grep -E "$LOG_PATTERN" > /tmp/kubelet_issues.log; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+node_name() {
+    # Use short hostname as the node identifier (matches typical k8s naming)
+    hostname -s
+}
+
+get_node_status() {
+    # Retrieves the STATUS column for this node from `kubectl get nodes`
+    local name
+    name="$(node_name)"
+    kubectl get nodes "$name" -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[?(@.type=="Ready")].status --no-headers 2>/dev/null |
+        awk '{print $2}'
+}
+
+list_node_ip() {
+    # Show IPv4 addresses assigned to the primary interface(s)
+    ip -4 addr show scope global | awk '/inet/ {print $2}'
+}
+
+restart_kubelet() {
+    echo "Attempting to restart kubelet..."
+    sudo systemctl restart kubelet
+    echo "kubelet restart requested."
+}
+
+#--- Main Execution ------------------------------------------------
+
+check_requirements
+
+echo "=== Step 1: Scanning kubelet logs for errors/warnings (last $LOG_SINCE) ==="
+if has_errors_in_logs; then
+    echo "Found error/warning entries in kubelet logs:"
+    cat /tmp/kubelet_issues.log
+    rm -f /tmp/kubelet_issues.log
+    exit 2
+else
+    echo "No error or warning messages detected in recent kubelet logs."
+    rm -f /tmp/kubelet_issues.log
+fi
+
+echo ""
+echo "=== Step 2: Verifying node presence via kubectl ==="
+NODE_STATUS=$(get_node_status || true)
+
+if [[ -z "$NODE_STATUS" ]]; then
+    echo "Node $(node_name) NOT listed in 'kubectl get nodes'."
+    echo "=== Step 3: Checking network configuration ==="
+    IP_LIST=$(list_node_ip)
+    if [[ -z "$IP_LIST" ]]; then
+        echo "No IP address assigned to this node. Network configuration may be broken."
+        exit 3
+    else
+        echo "Assigned IP addresses:"
+        echo "$IP_LIST"
+        echo "Ensure the node can reach the control plane (ping the API server, etc.)."
+        exit 4
+    fi
+else
+    echo "Node $(node_name) reported status: $NODE_STATUS"
+    if [[ "$NODE_STATUS" != "True" && "$NODE_STATUS" != "Ready" ]]; then
+        echo "Node is in a non‑ready state."
+        echo "=== Step 4: Restarting kubelet service ==="
+        restart_kubelet
+        echo "After restart, re‑run 'kubectl get nodes' to verify status."
+        exit 5
+    else
+        echo "Node is healthy (Ready). No further action required."
+        exit 0
+    fi
+fi
