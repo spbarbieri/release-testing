@@ -1,0 +1,137 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: k8s_pod_debug.sh
+# Purpose: Gather diagnostic information for a given pod and,
+#          optionally, delete & recreate it as a last‑resort fix.
+# ------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") -p <pod_name> [-n <namespace>] [--delete]
+
+Options:
+  -p <pod_name>      Name of the pod to investigate (required)
+  -n <namespace>     Namespace where the pod resides (default: default)
+  --delete           Delete and let the controller recreate the pod after diagnostics
+  -h                 Show this help message
+EOF
+    exit 1
+}
+
+# -------------------------
+# Parse command line args
+# -------------------------
+POD=""
+NAMESPACE="default"
+DELETE_POD=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p)
+            POD="${2:-}"
+            shift 2
+            ;;
+        -n)
+            NAMESPACE="${2:-}"
+            shift 2
+            ;;
+        --delete)
+            DELETE_POD=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+if [[ -z "$POD" ]]; then
+    echo "Error: Pod name is required."
+    usage
+fi
+
+echo "=== Debugging pod '$POD' in namespace '$NAMESPACE' ==="
+
+# ---------------------------------
+# Helper: safe execution wrapper
+# ---------------------------------
+run_cmd() {
+    local description="$1"
+    shift
+    echo -e "\n--- $description ---"
+    "$@"
+}
+
+# ----------------------------------------------------
+# 1. Full pod description (includes conditions/events)
+# ----------------------------------------------------
+run_cmd "Pod description" kubectl describe pod "$POD" -n "$NAMESPACE"
+
+# ----------------------------------------------------
+# 2. Identify node hosting the pod and its status
+# ----------------------------------------------------
+NODE=$(kubectl get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
+if [[ -z "$NODE" ]]; then
+    echo "Unable to determine node for pod $POD."
+else
+    run_cmd "Node '$NODE' status" kubectl get node "$NODE" -o wide
+fi
+
+# ----------------------------------------------------
+# 3. Fetch recent pod logs (last 100 lines)
+# ----------------------------------------------------
+run_cmd "Recent pod logs (tail -100)" kubectl logs "$POD" -n "$NAMESPACE" --tail=100
+
+# ----------------------------------------------------
+# 4. Resource consumption snapshot
+# ----------------------------------------------------
+if kubectl top pod "$POD" -n "$NAMESPACE" >/dev/null 2>&1; then
+    run_cmd "Current resource usage (CPU/Memory)" kubectl top pod "$POD" -n "$NAMESPACE"
+else
+    echo -e "\n--- Skipping 'kubectl top' ---"
+    echo "Metrics server may not be available or the command failed."
+fi
+
+# ----------------------------------------------------
+# 5. Re‑display events (already part of describe, but explicit)
+# ----------------------------------------------------
+run_cmd "Pod events (explicit)" kubectl get events -n "$NAMESPACE" --field-selector involvedObject.name="$POD" --sort-by=.metadata.creationTimestamp
+
+# ----------------------------------------------------
+# 6. Optional delete & recreate
+# ----------------------------------------------------
+if $DELETE_POD; then
+    read -r -p "Do you really want to DELETE pod '$POD'? This will trigger a new pod creation if managed by a controller. [y/N]: " confirm
+    if [[ "${confirm,,}" == "y" || "${confirm,,}" == "yes" ]]; then
+        run_cmd "Deleting pod" kubectl delete pod "$POD" -n "$NAMESPACE"
+        echo "Pod deletion requested. Waiting for replacement..."
+        # Wait up to 60 seconds for a new pod with the same label selector to become Ready
+        LABELS=$(kubectl get pod "$POD" -n "$NAMESPACE" -o jsonpath='{range .metadata.labels}{.}={.}, {end}' | sed 's/, $//')
+        timeout=60
+        interval=5
+        elapsed=0
+        while (( elapsed < timeout )); do
+            READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "$LABELS" -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' | grep -c true || true)
+            TOTAL_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "$LABELS" --no-headers | wc -l)
+            if (( READY_COUNT > 0 && READY_COUNT == TOTAL_COUNT )); then
+                echo "New pod(s) are ready."
+                break
+            fi
+            sleep "$interval"
+            ((elapsed+=interval))
+        done
+        if (( elapsed >= timeout )); then
+            echo "Warning: Timeout waiting for new pod to become ready."
+        fi
+    else
+        echo "Deletion aborted by user."
+    fi
+fi
+
+echo -e "\n=== Diagnostic run completed ==="
