@@ -1,0 +1,44 @@
+- name: Execute manual action workflow
+  hosts: manual_hosts  # Define this group in your inventory for machines needing manual intervention
+  gather_facts: false
+  vars:
+    manual_action_message: "Please perform the required manual operation now. Press Enter when completed."
+    manual_timeout_seconds: 3600  # Maximum wait time in seconds for the operator
+  tasks:
+
+    - name: Display manual action instructions
+      ansible.builtin.debug:
+        msg: "{{ manual_action_message }}"
+
+    - name: Wait for operator confirmation
+      block:
+
+        - name: Pause for manual completion
+          ansible.builtin.pause:
+            prompt: "Press ENTER to confirm manual step completed"
+            timeout: "{{ manual_timeout_seconds }}"
+          register: pause_result
+          # pause_result.timed_out will be true if the timeout expires
+
+        - name: Verify manual step confirmed
+          ansible.builtin.assert:
+            that:
+              - pause_result.user_input is defined
+            fail_msg: "Manual step was not confirmed within the allotted timeout."
+
+      rescue:
+
+        - name: Abort due to missing confirmation
+          ansible.builtin.fail:
+            msg: "Manual action not confirmed; aborting play."
+
+      always:
+
+        - name: Log manual step outcome
+          ansible.builtin.debug:
+            msg: >-
+              {% if pause_result.timed_out | default(false) %}
+                Manual step timed out after {{ manual_timeout_seconds }} seconds.
+              {% else %}
+                Manual step confirmed by operator.
+              {% endif %}
