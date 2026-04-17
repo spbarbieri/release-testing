@@ -1,0 +1,254 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# Script: ar_event_diagnostics.sh
+# Description:
+#   Collects comprehensive diagnostics for AR Release testing events (IDs 281/283)
+#   to aid troubleshooting JVM issues such as thread pool exhaustion, GC pauses,
+#   and queue lag. All outputs are stored under a timestamped directory.
+#
+# Usage:
+#   ./ar_event_diagnostics.sh -p <PID> [-s <service_name>] [-t <temp_dir>]
+#
+# Options:
+#   -p PID          Process ID of the Java service (required unless -s is given)
+#   -s SERVICE      Systemd service name; script will resolve its main PID
+#   -t DIR          Base temporary directory (default: /tmp)
+#   -h              Show this help message and exit
+# ==============================================================================
+
+# --------------------------- Default Variables ---------------------------------
+BASE_TMP_DIR="/tmp"
+SERVICE_NAME=""
+PID=""
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+OUTPUT_DIR=""
+
+# --------------------------- Helper Functions ----------------------------------
+print_usage() {
+    echo "Usage: $0 -p <PID> [-s <service_name>] [-t <temp_dir>]"
+    echo ""
+    echo "Options:"
+    echo "  -p PID          Process ID of the Java service (required unless -s is given)"
+    echo "  -s SERVICE      Systemd service name; script will resolve its main PID"
+    echo "  -t DIR          Base temporary directory (default: /tmp)"
+    echo "  -h              Show this help message and exit"
+}
+
+error_exit() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+check_cmd() {
+    local cmd=$1
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error_exit "'$cmd' command not found. Please install it before running this script."
+    fi
+}
+
+resolve_pid_from_service() {
+    local svc=$1
+    # Get MainPID from systemd
+    local pid_line
+    pid_line=$(systemctl show -p MainPID "$svc" 2>/dev/null || true)
+    if [[ -z "$pid_line" ]]; then
+        error_exit "Unable to retrieve MainPID for service '$svc'. Is it a valid systemd unit?"
+    fi
+    local pid=${pid_line#MainPID=}
+    if [[ "$pid" == "0" ]] || [[ -z "$pid" ]]; then
+        error_exit "Service '$svc' does not have a running MainPID."
+    fi
+    echo "$pid"
+}
+
+create_output_dir() {
+    local base_dir=$1
+    local ts=$2
+    OUTPUT_DIR="${base_dir}/ar_diag_${ts}"
+    mkdir -p "$OUTPUT_DIR"
+    echo "$OUTPUT_DIR"
+}
+
+run_and_save() {
+    local description=$1
+    local cmd=$2
+    local outfile=$3
+
+    echo "=== ${description} ===" | tee -a "$OUTPUT_DIR/summary.log"
+    echo "Command: $cmd" >>"$OUTPUT_DIR/summary.log"
+    eval "$cmd" >"$outfile" 2>>"$OUTPUT_DIR/errors.log" || echo "Warning: Command failed ($description)" >>"$OUTPUT_DIR/summary.log"
+    echo "Saved to $outfile" >>"$OUTPUT_DIR/summary.log"
+    echo "" >>"$OUTPUT_DIR/summary.log"
+}
+
+# --------------------------- Argument Parsing ----------------------------------
+while getopts ":p:s:t:h" opt; do
+    case $opt in
+        p) PID="$OPTARG" ;;
+        s) SERVICE_NAME="$OPTARG" ;;
+        t) BASE_TMP_DIR="$OPTARG" ;;
+        h) print_usage; exit 0 ;;
+        \?) error_exit "Invalid option: -$OPTARG" ;;
+        :) error_exit "Option -$OPTARG requires an argument." ;;
+    esac
+done
+
+# Validate inputs
+if [[ -z "$PID" && -z "$SERVICE_NAME" ]]; then
+    error_exit "Either -p <PID> or -s <service_name> must be supplied."
+fi
+
+if [[ -n "$SERVICE_NAME" ]]; then
+    PID=$(resolve_pid_from_service "$SERVICE_NAME")
+fi
+
+# Ensure PID is numeric and process exists
+if ! [[ "$PID" =~ ^[0-9]+$ ]]; then
+    error_exit "Provided PID ('$PID') is not a valid number."
+fi
+if ! kill -0 "$PID" >/dev/null 2>&1; then
+    error_exit "No process with PID $PID is running."
+fi
+
+# Prepare output directory
+create_output_dir "$BASE_TMP_DIR" "$TIMESTAMP"
+echo "Diagnostics will be saved under: $OUTPUT_DIR"
+
+# --------------------------- Dependency Checks --------------------------------
+for cmd in jstat jcmd jstack jmap grep awk date top iostat systemctl; do
+    check_cmd "$cmd"
+done
+
+# Optional Kafka tool detection
+KAFKA_CMD="kafka-consumer-groups.sh"
+if command -v "$KAFKA_CMD" >/dev/null 2>&1; then
+    KAFKA_AVAILABLE=true
+else
+    KAFKA_AVAILABLE=false
+    echo "Note: $KAFKA_CMD not found – Kafka consumer group inspection will be skipped." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# --------------------------- Diagnostic Collection -----------------------------
+# 1. JVM GC statistics (jstat)
+run_and_save "JVM GC Statistics (jstat)" \
+    "jstat -gc $PID 1000 1" \
+    "$OUTPUT_DIR/jstat_gc.txt"
+
+# 2. Native memory summary (jcmd)
+run_and_save "Native Memory Summary (jcmd)" \
+    "jcmd $PID VM.native_memory summary" \
+    "$OUTPUT_DIR/native_memory.txt"
+
+# 3. Thread dump (jstack)
+THREAD_DUMP_FILE="$OUTPUT_DIR/thread_dump_${TIMESTAMP}.txt"
+run_and_save "Thread Dump (jstack)" \
+    "jstack -l $PID" \
+    "$THREAD_DUMP_FILE"
+
+# 4. Live heap dump (jmap) – may be heavy; run in background
+HEAP_DUMP_FILE="$OUTPUT_DIR/heap_dump_${TIMESTAMP}.hprof"
+{
+    echo "=== Heap Dump (jmap) ===" >>"$OUTPUT_DIR/summary.log"
+    jmap -dump:live,format=b,file="$HEAP_DUMP_FILE" "$PID" 2>>"$OUTPUT_DIR/errors.log"
+    echo "Heap dump saved to $HEAP_DUMP_FILE" >>"$OUTPUT_DIR/summary.log"
+} &
+
+# 5. Recent GC log entries (if gc.log exists)
+GC_LOG="/var/log/app/gc.log"
+if [[ -f "$GC_LOG" ]]; then
+    run_and_save "Recent GC Log Entries (tail -n 50)" \
+        "grep -i \"GC\" \"$GC_LOG\" | tail -n 50" \
+        "$OUTPUT_DIR/gc_log_tail.txt"
+else
+    echo "GC log not found at $GC_LOG – skipping." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# 6. Application log search for event IDs 281/283
+APP_LOG="/var/log/app/application.log"
+EVENT_GREP_PATTERN='AR Release testing (283|281)'
+if [[ -f "$APP_LOG" ]]; then
+    run_and_save "Application Log Search for Events 281/283" \
+        "grep -E \"$EVENT_GREP_PATTERN\" \"$APP_LOG\"" \
+        "$OUTPUT_DIR/event_logs.txt"
+else
+    echo "Application log not found at $APP_LOG – skipping." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# 7. Kafka consumer group status (optional)
+if $KAFKA_AVAILABLE; then
+    KAFKA_GROUP="ar-release-testing"
+    KAFKA_BOOTSTRAP="broker1:9092"
+    run_and_save "Kafka Consumer Group Details" \
+        "\"$KAFKA_CMD\" --bootstrap-server $KAFKA_BOOTSTRAP --describe --group $KAFKA_GROUP" \
+        "$OUTPUT_DIR/kafka_group.txt"
+else
+    echo "Kafka consumer-group inspection skipped due to missing tool." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# 8. Configuration sanity check
+CONFIG_FILE="/opt/app/conf/event_processor.yml"
+if [[ -f "$CONFIG_FILE" ]]; then
+    run_and_save "Thread/Timeout Settings in Config" \
+        "grep -E \"thread|timeout\" \"$CONFIG_FILE\"" \
+        "$OUTPUT_DIR/config_thread_timeout.txt"
+else
+    echo "Config file not found at $CONFIG_FILE – skipping." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# 9. Top snapshot for the target PID
+run_and_save "Top Snapshot (process $PID)" \
+    "top -b -d 5 -p $PID -n 1 | head -n 20" \
+    "$OUTPUT_DIR/top_snapshot.txt"
+
+# 10. I/O stats (iostat)
+run_and_save "I/O Stats (iostat -xz 5, one iteration)" \
+    "iostat -xz 5 1" \
+    "$OUTPUT_DIR/iostat.txt"
+
+# 11. Downstream API health check (example URL)
+DOWNSTREAM_URL="http://downstream/api"
+run_and_save "Downstream API Health Check (HTTP status)" \
+    "curl -s -o /dev/null -w \"%{http_code}\" $DOWNSTREAM_URL" \
+    "$OUTPUT_DIR/downstream_http_status.txt"
+
+# 12. Java version verification
+run_and_save "Java Version" \
+    "java -version 2>&1" \
+    "$OUTPUT_DIR/java_version.txt"
+
+# 13. Optional Prometheus query (requires PROMETHEUS_ENDPOINT env var)
+if [[ -n "${PROMETHEUS_ENDPOINT:-}" ]]; then
+    QUERY='rate(jvm_gc_pause_seconds_sum[5m])'
+    PROM_QUERY_URL="${PROMETHEUS_ENDPOINT}?query=$(urlencode "$QUERY")"
+    run_and_save "Prometheus GC Pause Rate Query" \
+        "curl -s \"$PROM_QUERY_URL\"" \
+        "$OUTPUT_DIR/prometheus_gc_pause.json"
+else
+    echo "PROMETHEUS_ENDPOINT not set – skipping Prometheus queries." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# Wait for background heap dump to finish (with timeout)
+HEAP_TIMEOUT=300  # seconds
+SECONDS_ELAPSED=0
+while ps -p $$ >/dev/null 2>&1 && (( SECONDS_ELAPSED < HEAP_TIMEOUT )) && kill -0 "$(pgrep -P $$ jmap)" 2>/dev/null; do
+    sleep 5
+    ((SECONDS_ELAPSED+=5))
+done
+if (( SECONDS_ELAPSED >= HEAP_TIMEOUT )); then
+    echo "Warning: Heap dump did not complete within $HEAP_TIMEOUT seconds." >>"$OUTPUT_DIR/summary.log"
+fi
+
+# --------------------------- Post‑collection Summary ---------------------------
+echo "------------------------------------------------------------" >>"$OUTPUT_DIR/summary.log"
+echo "Diagnostic collection completed at $(date)." >>"$OUTPUT_DIR/summary.log"
+echo "All artifacts located in: $OUTPUT_DIR" >>"$OUTPUT_DIR/summary.log"
+echo "Review the files above, especially:" >>"$OUTPUT_DIR/summary.log"
+echo "  * $THREAD_DUMP_FILE" >>"$OUTPUT_DIR/summary.log"
+echo "  * $HEAP_DUMP_FILE (large binary)" >>"$OUTPUT_DIR/summary.log"
+echo "  * $OUTPUT_DIR/jstat_gc.txt" >>"$OUTPUT_DIR/summary.log"
+echo "  * $OUTPUT_DIR/native_memory.txt" >>"$OUTPUT_DIR/summary.log"
+echo "------------------------------------------------------------"
+
+# End of script
