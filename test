@@ -1,0 +1,216 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: diagnose_custom_events.sh
+# Purpose: Automate common diagnostic steps for custom event
+#          related issues in a Java application.
+#
+# Steps performed:
+#   1. Grep application logs for "custom event".
+#   2. Launch JConsole for live JMX monitoring.
+#   3. Create a heap dump of the target JVM.
+#   4. Run static analysis (FindBugs & PMD) on source code.
+#   5. Enable debug logging in the application's config file.
+#   6. Restart the application service.
+#
+# Requirements:
+#   - Bash 4+
+#   - jconsole, jmap installed and reachable in $PATH
+#   - findbugs (or spotbugs) and pmd-cli installed (optional)
+#   - sudo privileges if restarting a systemd service
+# ------------------------------------------------------------
+
+#######################
+# Helper functions
+#######################
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} -l LOG_DIR -h HOSTNAME -p PORT -i PID [-d HEAP_DUMP] \\
+       [-c CONFIG_FILE] [-s SERVICE_NAME] [-src SRC_DIR]
+
+Options:
+  -l LOG_DIR        Directory containing *.log files to search.
+  -h HOSTNAME       Hostname for JConsole connection.
+  -P PORT           JMX port number.
+  -i PID            Process ID of the Java application.
+  -d HEAP_DUMP      Destination file for heap dump (default: ./heap.dump).
+  -c CONFIG_FILE    Application config file to toggle debug logging.
+  -s SERVICE_NAME   Systemd service name to restart (if applicable).
+  -src SRC_DIR      Source code directory for static analysis.
+  -v                Verbose mode (prints actions).
+  -?                Show this help message.
+EOF
+    exit 1
+}
+
+log_msg() {
+    local msg="\$*"
+    if [[ "\${VERBOSE:-false}" == true ]]; then
+        echo "[\$(date +'%Y-%m-%d %H:%M:%S')] \$msg"
+    fi
+}
+
+check_cmd() {
+    command -v "\$1" >/dev/null 2>&1 || {
+        echo "Error: Required command '\$1' not found in PATH." >&2
+        exit 1
+    }
+}
+
+#######################
+# Parse arguments
+#######################
+
+# Default values
+HEAP_DUMP="./heap.dump"
+VERBOSE=false
+
+while getopts ":l:h:P:i:d:c:s:src:v?" opt; do
+    case "\$opt" in
+        l) LOG_DIR="\$OPTARG" ;;
+        h) HOSTNAME="\$OPTARG" ;;
+        P) PORT="\$OPTARG" ;;
+        i) PID="\$OPTARG" ;;
+        d) HEAP_DUMP="\$OPTARG" ;;
+        c) CONFIG_FILE="\$OPTARG" ;;
+        s) SERVICE_NAME="\$OPTARG" ;;
+        src) SRC_DIR="\$OPTARG" ;;
+        v) VERBOSE=true ;;
+        ?) usage ;;
+        *) usage ;;
+    esac
+done
+
+# Verify mandatory arguments
+[[ -z "\${LOG_DIR:-}" ]] && { echo "Missing -l LOG_DIR"; usage; }
+[[ -z "\${HOSTNAME:-}" ]] && { echo "Missing -h HOSTNAME"; usage; }
+[[ -z "\${PORT:-}" ]] && { echo "Missing -P PORT"; usage; }
+[[ -z "\${PID:-}" ]] && { echo "Missing -i PID"; usage; }
+
+#######################
+# Preconditions
+#######################
+
+# Ensure required binaries exist
+check_cmd grep
+check_cmd jconsole
+check_cmd jmap
+
+# Optional tools
+HAS_FINDBUGS=false
+if command -v findbugs >/dev/null 2>&1; then
+    HAS_FINDBUGS=true
+elif command -v spotbugs >/dev/null 2>&1; then
+    HAS_FINDBUGS=true
+fi
+
+HAS_PMD=false
+if command -v pmd >/dev/null 2>&1; then
+    HAS_PMD=true
+fi
+
+#######################
+# 1. Search logs for custom events
+#######################
+log_msg "Step 1: Searching logs in '\$LOG_DIR' for \"custom event\"..."
+GREP_OUTPUT="custom_event_issues_\$(date +%Y%m%d_%H%M%S).txt"
+mkdir -p "\$(dirname "\$GREP_OUTPUT")"
+grep -i --color=never 'custom event' "\$LOG_DIR"/*.log > "\$GREP_OUTPUT" || true
+log_msg "Log grep completed. Results saved to '\$GREP_OUTPUT'."
+
+#######################
+# 2. Launch JConsole for live monitoring
+#######################
+log_msg "Step 2: Starting JConsole for host '\$HOSTNAME' on port '\$PORT'..."
+JCONSOLE_CMD="jconsole \${HOSTNAME}:\${PORT}"
+# Run in background so script can continue; detach from terminal if possible.
+nohup \$JCONSOLE_CMD >/dev/null 2>&1 &
+JCONSOLE_PID=\$!
+log_msg "JConsole launched (PID=\$JCONSOLE_PID). Close it manually when done."
+
+#######################
+# 3. Generate heap dump
+#######################
+log_msg "Step 3: Generating heap dump for PID \$PID -> '\$HEAP_DUMP' ..."
+jmap -dump:format=b,file="\$HEAP_DUMP" "\$PID"
+log_msg "Heap dump created at '\$HEAP_DUMP'."
+
+#######################
+# 4. Static analysis (FindBugs/SpotBugs & PMD)
+#######################
+if [[ -n "\${SRC_DIR:-}" ]]; then
+    if [[ ! -d "\$SRC_DIR" ]]; then
+        echo "Warning: Source directory '\$SRC_DIR' does not exist – skipping static analysis."
+    else
+        # FindBugs / SpotBugs
+        if \$HAS_FINDBUGS; then
+            FIND_BUGS_OUT="findbugs_report_\$(date +%Y%m%d_%H%M%S).xml"
+            log_msg "Running FindBugs/SpotBugs on '\$SRC_DIR' → '\$FIND_BUGS_OUT' ..."
+            if command -v findbugs >/dev/null 2>&1; then
+                findbugs -textui -output "\$FIND_BUGS_OUT" "\$SRC_DIR"
+            else
+                spotbugs -textui -output "\$FIND_BUGS_OUT" "\$SRC_DIR"
+            fi
+            log_msg "FindBugs report saved to '\$FIND_BUGS_OUT'."
+        else
+            log_msg "FindBugs/SpotBugs not installed – skipping."
+        fi
+
+        # PMD
+        if \$HAS_PMD; then
+            PMD_OUT="pmd_report_\$(date +%Y%m%d_%H%M%S).txt"
+            log_msg "Running PMD on '\$SRC_DIR' → '\$PMD_OUT' ..."
+            pmd -d "\$SRC_DIR" -R java-basic,java-design -f text > "\$PMD_OUT"
+            log_msg "PMD report saved to '\$PMD_OUT'."
+        else
+            log_msg "PMD not installed – skipping."
+        fi
+    fi
+else
+    log_msg "Source directory not supplied (-src); static analysis skipped."
+fi
+
+#######################
+# 5. Enable debug logging (if config file provided)
+#######################
+if [[ -n "\${CONFIG_FILE:-}" ]]; then
+    if [[ ! -f "\$CONFIG_FILE" ]]; then
+        echo "Warning: Config file '\$CONFIG_FILE' not found – cannot enable debug logging."
+    else
+        BACKUP_CFG="\${CONFIG_FILE}.bak.\$(date +%s)"
+        cp "\$CONFIG_FILE" "\$BACKUP_CFG"
+        log_msg "Backup of config created at '\$BACKUP_CFG'."
+
+        # Example: assume property like log.level=INFO ; change to DEBUG
+        log_msg "Enabling DEBUG level in config file..."
+        sed -i.bak -E 's/(log\.level\s*=\s*)[A-Z]+/\1DEBUG/' "\$CONFIG_FILE"
+        log_msg "Debug logging enabled in '\$CONFIG_FILE'."
+    fi
+else
+    log_msg "No config file specified; skipping debug logging adjustment."
+fi
+
+#######################
+# 6. Restart application (systemd service)
+#######################
+if [[ -n "\${SERVICE_NAME:-}" ]]; then
+    log_msg "Step 6: Restarting systemd service '\$SERVICE_NAME'..."
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl restart "\$SERVICE_NAME"
+        sudo systemctl status "\$SERVICE_NAME" --no-pager
+        log_msg "Service '\$SERVICE_NAME' restarted successfully."
+    else
+        echo "Error: systemctl not available – cannot restart service."
+        exit 1
+    fi
+else
+    log_msg "No service name provided; please restart the application manually if needed."
+fi
+
+#######################
+# Cleanup
+#######################
+log_msg "Script completed. Remember to close JConsole (PID=\$JCONSOLE_PID) when finished."
+exit 0
