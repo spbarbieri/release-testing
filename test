@@ -1,0 +1,103 @@
+- name: Diagnose and remediate Kubernetes node health issues
+  hosts: k8s_nodes   # Inventory group containing worker nodes to inspect
+  become: true
+  vars:
+    # Time window for log inspection (e.g., last hour); adjust as needed
+    kubelet_log_since: "1h"
+  tasks:
+    - name: Collect kubelet logs and search for errors or warnings
+      ansible.builtin.shell: |
+        journalctl -u kubelet --since "{{ kubelet_log_since }}" --no-pager \
+          | grep -iE 'error|warning' || true
+      register: kubelet_log_findings
+      changed_when: false
+      # Ensure the task never fails even if grep finds nothing
+      ignore_errors: true
+
+    - name: Determine if any error or warning entries were found
+      ansible.builtin.set_fact:
+        kubelet_has_issues: "{{ kubelet_log_findings.stdout != '' }}"
+
+    - name: Log detection of issues in kubelet logs
+      ansible.builtin.debug:
+        msg: "Kubelet logs contain errors/warnings; aborting further checks."
+      when: kubelet_has_issues
+
+    - name: Abort play when kubelet log issues exist
+      ansible.builtin.meta: end_play
+      when: kubelet_has_issues
+
+    - name: Retrieve full node list from the control plane
+      block:
+        - name: Execute kubectl to obtain node JSON data
+          ansible.builtin.command: kubectl get nodes -o json
+          register: kubectl_nodes
+          changed_when: false
+          # Fail explicitly if kubectl returns a non-zero exit code
+          failed_when: kubectl_nodes.rc != 0
+
+        - name: Extract this node's Ready condition status
+          ansible.builtin.set_fact:
+            node_ready_status: >-
+              {{
+                (
+                  (kubectl_nodes.stdout | from_json).items
+                  | selectattr('metadata.name','equalto',inventory_hostname)
+                  | map(attribute='status.conditions')
+                  | list
+                )[0]
+                | selectattr('type','equalto','Ready')
+                | map(attribute='status')
+                | list
+                | first
+                | default('Unknown')
+              }}
+      rescue:
+        - name: Report failure to query node status via kubectl
+          ansible.builtin.fail:
+            msg: "Unable to retrieve node status with kubectl; ensure kubectl is configured correctly."
+
+    - name: Evaluate node readiness
+      ansible.builtin.set_fact:
+        node_is_ready: "{{ node_ready_status == 'True' }}"
+
+    - name: Show node readiness outcome
+      ansible.builtin.debug:
+        msg: "Node '{{ inventory_hostname }}' Ready condition = {{ node_ready_status }}"
+
+    - name: Verify network interface(s) have an assigned IP address
+      ansible.builtin.command: ip -brief address show up
+      register: ip_interface_info
+      changed_when: false
+      # Continue even if no interfaces are up; we'll handle later
+      ignore_errors: true
+
+    - name: Determine if at least one active interface has an IP
+      ansible.builtin.set_fact:
+        node_has_ip: "{{ ip_interface_info.stdout_lines | length > 0 }}"
+
+    - name: Debug network interface discovery
+      ansible.builtin.debug:
+        msg: "Active interfaces with IPs: {{ ip_interface_info.stdout_lines }}"
+      when: node_has_ip
+
+    - name: Restart kubelet service when node is unreachable or unhealthy
+      block:
+        - name: Attempt to restart kubelet to recover node health
+          ansible.builtin.systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: yes
+          register: kubelet_restart
+          changed_when: kubelet_restart.changed
+
+        - name: Confirm kubelet restart succeeded
+          ansible.builtin.debug:
+            msg: "kubelet service restarted successfully."
+      when:
+        - not node_is_ready               # Node reports NotReady or Unknown
+        - node_has_ip                     # Network appears functional
+      rescue:
+        - name: Report failure to restart kubelet
+          ansible.builtin.fail:
+            msg: "Failed to restart kubelet; manual intervention required."
