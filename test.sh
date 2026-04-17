@@ -2,142 +2,109 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Script: diagnose_k8s_node.sh
-# Purpose: Diagnose common issues on a Kubernetes worker node.
-# Steps:
-#   1. Scan kubelet logs for errors or warnings.
-#   2. Verify node status via `kubectl get nodes`.
-#   3. If node is unreachable, confirm network interface configuration.
-#   4. If node is reachable but not Ready, attempt to restart kubelet.
+# Configuration
 # ------------------------------------------------------------
+CPU_PROC_THRESHOLD=80.0      # % CPU usage per process considered excessive
+TOTAL_CPU_THRESHOLD=90.0     # % of total CPU capacity (based on load avg) that triggers a warning
+WHITELIST=("sshd" "init" "systemd" "bash" "cron")  # Processes never to terminate
 
-#--- Configuration -------------------------------------------------
-# Adjust these variables as needed for your environment.
-KUBELET_SERVICE="kubelet"
-LOG_SEARCH_PATTERNS=("error" "warning")
-MAX_LOG_LINES=1000          # Number of recent log lines to inspect
-NODE_NAME="$(hostname)"     # Assumes the node's hostname matches its name in K8s
-#-------------------------------------------------------------------
-
-log() {
-    local level="$1"; shift
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+is_whitelisted() {
+    local proc_name="$1"
+    for w in "${WHITELIST[@]}"; do
+        [[ "$proc_name" == "$w" ]] && return 0
+    done
+    return 1
 }
 
-exit_with_error() {
-    log "ERROR" "$@"
-    exit 1
-}
+# ------------------------------------------------------------
+# Gather system-wide CPU metrics
+# ------------------------------------------------------------
+read -r load1 load5 load15 < /proc/loadavg
+cpu_cores=$(nproc)
 
-# 1. Examine kubelet logs for errors or warnings
-check_logs() {
-    log "INFO" "Scanning ${KUBELET_SERVICE} logs for errors/warnings..."
-    # Pull recent logs via journalctl; fallback to syslog if unavailable
-    if command -v journalctl >/dev/null; then
-        LOG_OUTPUT=$(journalctl -u "${KUBELET_SERVICE}" -n "${MAX_LOG_LINES}" --no-pager || true)
-    else
-        LOG_OUTPUT=$(grep -i "${KUBELET_SERVICE}" /var/log/syslog | tail -n "${MAX_LOG_LINES}" || true)
+# Convert 1‑minute load average to a percentage of total core capacity
+load_percent=$(awk "BEGIN {printf \"%.2f\", ($load1/$cpu_cores)*100}")
+
+echo "=== System Load ==="
+printf "Load avg (1m): %.2f (%.2f%% of %d cores)\n" "$load1" "$load_percent" "$cpu_cores"
+
+if (( $(awk "BEGIN {print ($load_percent > $TOTAL_CPU_THRESHOLD)}") )); then
+    echo "WARNING: Overall CPU load exceeds ${TOTAL_CPU_THRESHOLD}%."
+fi
+
+# ------------------------------------------------------------
+# List top CPU‑consuming processes
+# ------------------------------------------------------------
+process_list=$(ps -eo pid,comm,%cpu --sort=-%cpu | awk 'NR>1')
+echo "=== Top CPU Consumers (up to 10) ==="
+printf "%-8s %-20s %s\n" "PID" "COMMAND" "CPU%"
+echo "$process_list" | head -n 10
+
+# ------------------------------------------------------------
+# Detect and flag abnormal processes
+# ------------------------------------------------------------
+declare -a to_kill=()
+
+while IFS= read -r line; do
+    pid=$(awk '{print $1}' <<<"$line")
+    cmd=$(awk '{print $2}' <<<"$line")
+    cpu=$(awk '{print $3}' <<<"$line")
+    [[ -z "$pid" ]] && continue
+
+    # Flag if CPU exceeds per‑process threshold
+    if (( $(awk "BEGIN {print ($cpu > $CPU_PROC_THRESHOLD)}") )); then
+        if is_whitelisted "$cmd"; then
+            echo "SKIP: Whitelisted $cmd (PID $pid) uses $cpu% CPU."
+        else
+            echo "MARK: $cmd (PID $pid) uses $cpu% CPU → candidate for termination."
+            to_kill+=("$pid")
+        fi
+    fi
+done <<<"$process_list"
+
+# ------------------------------------------------------------
+# Terminate flagged processes (with safety checks)
+# ------------------------------------------------------------
+if (( ${#to_kill[@]} )); then
+    echo "Processes slated for termination: ${to_kill[*]}"
+    
+    # Non‑interactive mode bypasses prompt
+    if [[ "${NON_INTERACTIVE:-}" != "true" ]]; then
+        read -rp "Proceed with termination? [y/N] " ans
+        ans=${ans,,}
+        if [[ "$ans" != y && "$ans" != yes ]]; then
+            echo "Termination aborted by user."
+            exit 0
+        fi
     fi
 
-    MATCHES=()
-    for pattern in "${LOG_SEARCH_PATTERNS[@]}"; do
-        while IFS= read -r line; do
-            MATCHES+=("$line")
-        done < <(printf "%s\n" "$LOG_OUTPUT" | grep -i "$pattern" || true)
+    # Graceful shutdown first
+    for pid in "${to_kill[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
     done
 
-    if (( ${#MATCHES[@]} > 0 )); then
-        log "WARN" "Found ${#MATCHES[@]} log entries matching error/warning patterns:"
-        printf '%s\n' "${MATCHES[@]}"
-        exit 0
-    else
-        log "INFO" "No error or warning messages detected in recent logs."
-    fi
-}
+    # Allow processes time to exit cleanly
+    sleep 5
 
-# 2. Verify node status via kubectl
-check_node_status() {
-    if ! command -v kubectl >/dev/null; then
-        exit_with_error "kubectl command not found. Install/ configure kubectl first."
-    fi
-
-    log "INFO" "Fetching node list from the control plane..."
-    NODE_TABLE=$(kubectl get nodes -o wide --no-headers)
-
-    # Extract the line corresponding to this node
-    NODE_LINE=$(printf "%s\n" "$NODE_TABLE" | awk "\$1 == \"${NODE_NAME}\"")
-    if [[ -z "$NODE_LINE" ]]; then
-        log "ERROR" "Node '${NODE_NAME}' not present in 'kubectl get nodes' output."
-        return 1
-    fi
-
-    # Expected columns: NAME STATUS ROLE AGE VERSION INTERNAL-IP EXTERNAL-IP OS-IMAGE KERNEL-VERSION CONTAINER-RUNTIME
-    NODE_STATUS=$(awk '{print $2}' <<<"$NODE_LINE")
-    log "INFO" "Node '${NODE_NAME}' status reported as: ${NODE_STATUS}"
-    echo "$NODE_STATUS"
-}
-
-# 3. Validate network interfaces have a non‑loopback IP
-verify_network() {
-    log "INFO" "Checking network interfaces for assigned IP addresses..."
-    IP_INFO=$(ip -brief addr show up primary scope global | awk '{print $1,$3}')
-    if [[ -z "$IP_INFO" ]]; then
-        log "ERROR" "No active non‑loopback network interfaces detected."
-        return 1
-    fi
-
-    log "INFO" "Active interfaces with IPs:"
-    printf '%s\n' "$IP_INFO"
-    return 0
-}
-
-# 4. Restart kubelet service
-restart_kubelet() {
-    log "INFO" "Attempting to restart ${KUBELET_SERVICE} service..."
-    if systemctl is-active --quiet "${KUBELET_SERVICE}"; then
-        sudo systemctl restart "${KUBELET_SERVICE}"
-        log "INFO" "${KUBELET_SERVICE} restarted successfully."
-    else
-        log "WARN" "${KUBELET_SERVICE} is not currently active; starting it instead."
-        sudo systemctl start "${KUBELET_SERVICE}"
-    fi
-}
-
-#-------------------- Main Execution Flow -------------------------
-
-# Step 1 – Log inspection
-check_logs
-
-# Step 2 – Node health via kubectl
-STATUS=$(check_node_status) || {
-    log "WARN" "Unable to retrieve node status; proceeding to network verification."
-    verify_network || exit_with_error "Network verification failed."
-    exit 0
-}
-
-if [[ "$STATUS" == "Ready" ]]; then
-    log "INFO" "Node is healthy (Ready). No further action required."
-    exit 0
-fi
-
-# At this point the node is listed but not Ready.
-log "WARN" "Node status is '${STATUS}'. Investigating possible causes."
-
-# Step 3 – Network connectivity check
-if ! verify_network; then
-    exit_with_error "Network connectivity appears broken. Resolve networking before retrying."
-fi
-
-# Step 4 – Attempt recovery by restarting kubelet
-restart_kubelet
-
-# Re‑query status after restart
-sleep 10
-NEW_STATUS=$(check_node_status) || exit_with_error "Failed to re‑query node status after restart."
-
-if [[ "$NEW_STATUS" == "Ready" ]]; then
-    log "INFO" "Node recovered and is now Ready."
+    # Force kill any that remain
+    for pid in "${to_kill[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Force killing PID $pid."
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
 else
-    log "ERROR" "Node remains in state '${NEW_STATUS}' after kubelet restart. Manual investigation required."
-    exit 1
+    echo "No abnormal high‑CPU processes detected."
 fi
+
+# ------------------------------------------------------------
+# Capacity recommendation
+# ------------------------------------------------------------
+if (( $(awk "BEGIN {print ($load_percent > $TOTAL_CPU_THRESHOLD)}") )); then
+    echo "RECOMMENDATION: Consider migrating workloads to another host or scaling up CPU resources."
+fi
+
+exit 0
