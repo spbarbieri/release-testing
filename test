@@ -1,0 +1,79 @@
+- name: Check status and events of Deployment Pods
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Namespace where the deployment resides
+    k8s_namespace: default
+    # Name of the deployment to inspect
+    deployment_name: test
+    # Label selector assuming pods are labeled with app=<deployment_name>
+    pod_label_selector: "app={{ deployment_name }}"
+  collections:
+    - community.kubernetes
+  tasks:
+    - name: Retrieve pods belonging to deployment {{ deployment_name }}
+      community.kubernetes.k8s_info:
+        kind: Pod
+        namespace: "{{ k8s_namespace }}"
+        label_selectors:
+          - "{{ pod_label_selector }}"
+      register: pod_info
+      # Abort early if API call fails
+      failed_when: pod_info.failed
+
+    - block:
+        - name: Fail if no pods were found
+          ansible.builtin.fail:
+            msg: "No pods found for deployment '{{ deployment_name }}' in namespace '{{ k8s_namespace }}'."
+          when: pod_info.resources | length == 0
+
+        - name: Display status of each pod
+          ansible.builtin.debug:
+            msg: >-
+              Pod {{ item.metadata.name }} – Phase: {{ item.status.phase }},
+              Ready: {{ (item.status.containerStatuses | selectattr('ready','equalto',true) | list) | length }}/{{ item.status.containerStatuses | length }}
+          loop: "{{ pod_info.resources }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: Retrieve recent events for each pod
+          community.kubernetes.k8s_info:
+            api_version: v1
+            kind: Event
+            namespace: "{{ k8s_namespace }}"
+            field_selectors:
+              - "involvedObject.kind=Pod"
+              - "involvedObject.name={{ item.metadata.name }}"
+          loop: "{{ pod_info.resources }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+          register: pod_events_raw
+          # Continue even if some pods have no events
+          ignore_errors: true
+
+        - name: Aggregate events per pod
+          set_fact:
+            pod_events: "{{ pod_events | default({}) | combine({ item.item.metadata.name: (item.resources | default([])) }) }}"
+          loop: "{{ pod_events_raw.results }}"
+
+        - name: Show latest event for each pod (if any)
+          ansible.builtin.debug:
+            msg: >-
+              Latest event for pod {{ pod_name }}: {{
+                (pod_events[pod_name] | sort(attribute='metadata.creationTimestamp'))[-1].message
+                | default('No events recorded')
+              }}
+          loop: "{{ pod_events.keys() | list }}"
+          loop_control:
+            loop_var: pod_name
+
+      rescue:
+        - name: Report retrieval failure
+          ansible.builtin.debug:
+            msg: "Error during pod status/event collection: {{ ansible_failed_result.msg }}"
+
+      always:
+        - name: Completion summary
+          ansible.builtin.debug:
+            msg: "Completed status and event check for deployment '{{ deployment_name }}'."
