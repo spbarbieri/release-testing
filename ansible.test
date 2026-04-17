@@ -1,0 +1,90 @@
+- name: Detect and mitigate high CPU consumption
+  hosts: monitored_hosts            # Inventory group containing hosts to monitor
+  become: true                     # Required for killing processes
+  vars:
+    top_n: 10                      # Number of top processes to examine
+    cpu_threshold: 80.0            # CPU usage percent considered abnormal
+    max_high_cpu_procs: 3          # Threshold to trigger migration/scaling recommendation
+    target_group: high_perf_nodes  # Group where workloads could be moved
+  tasks:
+    - name: Gather top CPU‑consuming processes
+      ansible.builtin.command: >
+        ps -eo pid,comm,%cpu --sort=-%cpu | head -n {{ top_n + 1 }}
+      register: top_processes_raw
+      changed_when: false
+      # Using ps ensures portability across most Linux distributions
+
+    - name: Parse process list into structured data
+      ansible.builtin.set_fact:
+        top_processes: >-
+          {{
+            top_processes_raw.stdout_lines[1:]
+            | map('regex_replace', '\s+', ' ')
+            | map('split', ' ')
+            | map('zip', ['pid','command','cpu'])
+            | map('items2dict')
+            | list
+          }}
+      # Skip header line, normalize whitespace, build dict per process
+
+    - name: Identify processes exceeding CPU threshold
+      ansible.builtin.set_fact:
+        high_cpu_procs: >-
+          {{ top_processes
+             | selectattr('cpu','float')
+             | selectattr('cpu','float', '>', cpu_threshold)
+             | list }}
+      # Convert cpu field to float for accurate comparison
+
+    - name: Report high CPU processes
+      ansible.builtin.debug:
+        msg: "PID {{ item.pid }} ({{ item.command }}) uses {{ item.cpu }}% CPU"
+      loop: "{{ high_cpu_procs }}"
+      when: high_cpu_procs | length > 0
+
+    - name: Gracefully terminate high CPU processes
+      block:
+        - name: Send SIGTERM to process
+          ansible.builtin.command: kill -15 {{ item.pid }}
+          args:
+            warn: false
+          ignore_errors: true
+          loop: "{{ high_cpu_procs }}"
+          loop_control:
+            label: "{{ item.pid }}"
+
+        - name: Wait for process to exit
+          ansible.builtin.wait_for:
+            path: "/proc/{{ item.pid }}"
+            state: absent
+            timeout: 30
+          loop: "{{ high_cpu_procs }}"
+          loop_control:
+            label: "{{ item.pid }}"
+          ignore_errors: true
+
+        - name: Force kill lingering processes
+          ansible.builtin.command: kill -9 {{ item.pid }}
+          args:
+            warn: false
+          when: "'/proc/' + item.pid is exists"
+          loop: "{{ high_cpu_procs }}"
+          loop_control:
+            label: "{{ item.pid }}"
+      rescue:
+        - name: Log termination failures
+          ansible.builtin.debug:
+            msg: "Failed to terminate PID {{ item.pid }} ({{ item.command }})"
+          loop: "{{ high_cpu_procs }}"
+      always:
+        - name: Summarize termination outcome
+          ansible.builtin.debug:
+            msg: "Handled {{ high_cpu_procs | length }} high‑CPU processes on {{ inventory_hostname }}."
+
+    - name: Recommend workload migration or scaling
+      ansible.builtin.debug:
+        msg: |
+          Detected {{ high_cpu_procs | length }} processes above {{ cpu_threshold }}% CPU.
+          Consider moving affected services to hosts in group '{{ target_group }}'
+          or provisioning additional CPU capacity on this host.
+      when: high_cpu_procs | length >= max_high_cpu_procs
