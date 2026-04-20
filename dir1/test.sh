@@ -7,100 +7,128 @@ set -euo pipefail
 # Steps:
 #   1. Scan recent kubelet logs for errors or warnings.
 #   2. If clean, verify node status via `kubectl get nodes`.
-#   3. If node not reachable, confirm the node has a valid IP.
-#   4. If node is reachable but still unhealthy, restart kubelet.
+#   3. If node is not Ready, confirm the node has a valid IP address.
+#   4. If networking looks fine but node is still unhealthy,
+#      restart the kubelet service.
 # ------------------------------------------------------------
 
 # Configurable parameters
-LOG_SINCE="1h"                # How far back to search logs (e.g., "30m", "2h")
+LOG_LOOKBACK="1h"               # How far back to search logs (compatible with journalctl)
 KUBELET_UNIT="kubelet"
-MAX_LOG_LINES=1000            # Limit displayed log lines when errors are found
+MAX_LOG_LINES=1000              # Limit displayed log lines when errors are found
+IP_INTERFACE_EXCLUDE="lo"       # Interface(s) to ignore when checking IPs
 
-# Helper: print a header
-header() {
-    echo -e "\n=== $* ===\n"
+# Helper: print timestamped messages
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $*"
 }
 
-# Step 1: Examine kubelet logs for errors or warnings
-header "Scanning kubelet logs for errors/warnings (last ${LOG_SINCE})"
-if command -v journalctl >/dev/null 2>&1; then
-    LOG_OUTPUT=$(journalctl -u "${KUBELET_UNIT}" --since="${LOG_SINCE}" \
-                 | grep -Ei "(error|warn)" || true)
-else
-    # Fallback to syslog if journalctl unavailable
-    LOG_FILE="/var/log/kubelet.log"
-    if [[ -f "${LOG_FILE}" ]]; then
-        LOG_OUTPUT=$(grep -Ei "(error|warn)" "${LOG_FILE}" || true)
+# Step 1 – Examine kubelet logs for errors or warnings
+check_logs() {
+    log_msg "Scanning ${KUBELET_UNIT} logs for errors/warnings (last ${LOG_LOOKBACK})..."
+    # Capture matching lines; ignore case; treat both "error" and "warning"
+    mapfile -t matches < <(
+        journalctl -u "${KUBELET_UNIT}" --since="${LOG_LOOKBACK}" \
+            | grep -Ei "(error|warning)" || true
+    )
+    if (( ${#matches[@]} > 0 )); then
+        log_msg "Found ${#matches[@]} error/warning entries:"
+        printf '%s\n' "${matches[@]:0:${MAX_LOG_LINES}}"
+        if (( ${#matches[@]} > MAX_LOG_LINES )); then
+            log_msg "... (${#matches[@]} total, truncated to ${MAX_LOG_LINES} lines)"
+        fi
+        exit 1
     else
-        LOG_OUTPUT=""
+        log_msg "No error or warning messages detected in recent logs."
     fi
-fi
+}
 
-if [[ -n "${LOG_OUTPUT}" ]]; then
-    echo "Found error/warning entries in kubelet logs:"
-    echo "${LOG_OUTPUT}" | tail -n "${MAX_LOG_LINES}"
-    echo "Please investigate the above log entries before proceeding."
-    exit 1
-else
-    echo "No error or warning messages detected in recent kubelet logs."
-fi
-
-# Step 2: Verify node status via kubectl
-header "Checking node status with kubectl"
-if ! command -v kubectl >/dev/null 2>&1; then
-    echo "Error: kubectl not installed or not in PATH."
-    exit 2
-fi
-
-NODE_NAME="$(hostname)"
-# Retrieve node line (NAME STATUS ...) from kubectl output
-NODE_LINE=$(kubectl get nodes -o wide | awk -v n="${NODE_NAME}" '$1==n')
-if [[ -z "${NODE_LINE}" ]]; then
-    echo "Node '${NODE_NAME}' not listed in 'kubectl get nodes'."
-    NODE_REACHABLE=false
-else
-    NODE_STATUS=$(echo "${NODE_LINE}" | awk '{print $2}')
-    echo "Node '${NODE_NAME}' reported status: ${NODE_STATUS}"
-    if [[ "${NODE_STATUS}" == "Ready" ]]; then
-        echo "Node is healthy. No further action required."
+# Step 2 – Verify node status via kubectl
+verify_node_status() {
+    local node_name
+    node_name="$(hostname)"
+    log_msg "Fetching node status for '${node_name}' via kubectl..."
+    
+    # Ensure kubectl is available
+    if ! command -v kubectl >/dev/null 2>&1; then
+        log_msg "ERROR: kubectl not found in PATH."
+        exit 2
+    fi
+    
+    # Get node line (CSV format for easier parsing)
+    local node_line
+    node_line=$(kubectl get nodes -o wide --no-headers | awk "\$1 == \"${node_name}\"")
+    
+    if [[ -z "$node_line" ]]; then
+        log_msg "Node '${node_name}' not listed in kubectl output. It may be unreachable from the control plane."
+        return 1
+    fi
+    
+    # Extract STATUS column (second field)
+    local status
+    status=$(echo "$node_line" | awk '{print $2}')
+    log_msg "Node status reported as: ${status}"
+    
+    if [[ "$status" == "Ready" ]]; then
+        log_msg "Node is healthy (Ready). No further action required."
         exit 0
     else
-        echo "Node status indicates a problem (${NODE_STATUS})."
-        NODE_REACHABLE=true
+        log_msg "Node is not Ready (status: ${status}). Proceeding with deeper diagnostics."
+        return 0
     fi
-fi
+}
 
-# Step 3: Verify network connectivity (IP assignment)
-header "Verifying network interfaces and IP addresses"
-IP_INFO=$(ip -brief addr show up primary scope global | awk '{print $1,$3}')
-if [[ -z "${IP_INFO}" ]]; then
-    echo "No active non‑loopback network interface with a global IP found."
-    echo "Network configuration may be missing or down."
-    exit 3
-else
-    echo "Active interfaces with IPs:"
-    echo "${IP_INFO}"
-fi
-
-# Step 4: Attempt recovery by restarting kubelet
-header "Attempting to recover node by restarting kubelet service"
-if systemctl is-active --quiet "${KUBELET_UNIT}"; then
-    echo "Restarting ${KUBELET_UNIT}..."
-    sudo systemctl restart "${KUBELET_UNIT}"
-    echo "Restart issued. Waiting briefly for kubelet to re‑register..."
-    sleep 15
-    # Re‑check node status after restart
-    NEW_STATUS=$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' || echo "Unknown")
-    if [[ "${NEW_STATUS}" == "True" ]]; then
-        echo "Node '${NODE_NAME}' is now Ready."
-        exit 0
+# Step 3 – Confirm the node has a usable IP address
+check_network_interface() {
+    log_msg "Checking network interfaces for a non‑loopback IP address..."
+    # List IPv4 addresses excluding loopback and excluded interfaces
+    local ips
+    ips=$(ip -4 addr show scope global | awk '/inet/ {print $2}' | cut -d/ -f1)
+    
+    if [[ -z "$ips" ]]; then
+        log_msg "WARNING: No global IPv4 address found on this node."
+        return 1
     else
-        echo "Node still not Ready after kubelet restart (status=${NEW_STATUS})."
-        exit 4
+        log_msg "Detected IP address(es): $ips"
+        return 0
     fi
-else
-    echo "kubelet service is not active. Starting it..."
-    sudo systemctl start "${KUBELET_UNIT}"
-    echo "Service started. Please re‑run the script to verify health."
-    exit 5
-fi
+}
+
+# Step 4 – Restart kubelet if node remains unhealthy
+restart_kubelet() {
+    log_msg "Attempting to restart the kubelet service..."
+    if systemctl is-active --quiet "${KUBELET_UNIT}"; then
+        sudo systemctl restart "${KUBELET_UNIT}"
+        log_msg "kubelet restarted successfully."
+    else
+        log_msg "kubelet service is not active; starting it instead."
+        sudo systemctl start "${KUBELET_UNIT}"
+    fi
+    
+    # Give kubelet a moment to settle before rechecking status
+    sleep 10
+    log_msg "Re‑evaluating node status after kubelet restart..."
+    verify_node_status || {
+        log_msg "Node still not Ready after kubelet restart. Manual investigation required."
+        exit 3
+    }
+}
+
+# -------------------- Main Execution Flow --------------------
+main() {
+    check_logs
+    if verify_node_status; then
+        # Node listed but not Ready → continue diagnostics
+        if ! check_network_interface; then
+            log_msg "Network issue detected. Please resolve IP configuration before proceeding."
+            exit 4
+        fi
+        restart_kubelet
+    else
+        # Node not listed at all → likely network/connectivity problem
+        log_msg "Node appears unreachable from the control plane. Verify network routes, firewalls, and that the node can reach the API server."
+        exit 5
+    fi
+}
+
+main "$@
