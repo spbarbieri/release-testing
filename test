@@ -1,0 +1,273 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Configuration – adjust these values to match your environment
+# ------------------------------------------------------------
+
+# Application log directory (expects plain text logs)
+LOG_DIR="/var/log/myapp"
+
+# Endpoint URL to test (the API or web endpoint experiencing errors)
+ENDPOINT_URL="https://api.example.com/v1/resource"
+
+# Backend services (host:port) that the endpoint depends on
+declare -a BACKEND_SERVICES=(
+    "service-a.internal:8080"
+    "service-b.internal:9090"
+    "db-primary.internal:5432"
+)
+
+# Source code base directory (for simple static checks)
+CODEBASE_DIR="/opt/myapp/src"
+
+# Report file path
+REPORT_FILE="/tmp/error_analysis_$(date +%Y%m%d_%H%M%S).txt"
+
+# Email address of the development team (requires local MTA or sendmail)
+DEV_TEAM_EMAIL="dev-team@example.com"
+
+# Load‑testing parameters (requires 'ab' – ApacheBench – to be installed)
+LOAD_TEST_CONCURRENCY=50
+LOAD_TEST_REQUESTS=1000
+
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+
+log_section() {
+    echo -e "\n===== $1 =====\n" | tee -a "$REPORT_FILE"
+}
+
+run_cmd() {
+    # Executes a command, captures stdout+stderr, appends to report
+    # Usage: run_cmd "description" cmd args...
+    local description=$1
+    shift
+    echo ">> $description" | tee -a "$REPORT_FILE"
+    "$@" >>"$REPORT_FILE" 2>&1
+    echo "" >>"$REPORT_FILE"
+}
+
+# ------------------------------------------------------------
+# 1. Analyse application logs for failing request patterns
+# ------------------------------------------------------------
+analyse_logs() {
+    log_section "Log Analysis – Failing Requests"
+
+    # Find lines containing HTTP status >=500 (adjust regex for your log format)
+    local fail_lines
+    fail_lines=$(grep -E "HTTP/[0-9\.]+\" [5][0-9]{2}" "$LOG_DIR"/*.log || true)
+
+    if [[ -z "$fail_lines" ]]; then
+        echo "No failing requests (5xx) found in logs." | tee -a "$REPORT_FILE"
+        return
+    fi
+
+    # Show top 10 most frequent failing URLs
+    echo "Top 10 failing URLs:" | tee -a "$REPORT_FILE"
+    echo "$fail_lines" |
+        awk -F'"' '{print $2}' |
+        awk '{print $2}' |
+        sort |
+        uniq -c |
+        sort -rn |
+        head -n 10 >>"$REPORT_FILE"
+
+    # Show distribution of status codes
+    echo -e "\nStatus code distribution:" | tee -a "$REPORT_FILE"
+    echo "$fail_lines" |
+        awk -F'"' '{print $3}' |
+        awk '{print $2}' |
+        sort |
+        uniq -c |
+        sort -rn >>"$REPORT_FILE"
+
+    # Identify common error messages (if present after status code)
+    echo -e "\nCommon error messages (first 200 chars):" | tee -a "$REPORT_FILE"
+    echo "$fail_lines" |
+        cut -d'"' -f4- |
+        cut -c1-200 |
+        sort |
+        uniq -c |
+        sort -rn |
+        head -n 10 >>"$REPORT_FILE"
+}
+
+# ------------------------------------------------------------
+# 2. Health check backend services
+# ------------------------------------------------------------
+check_backend_health() {
+    log_section "Backend Services Health Check"
+
+    for svc in "${BACKEND_SERVICES[@]}"; do
+        host=${svc%%:*}
+        port=${svc##*:}
+        echo "Checking $host:$port ..." | tee -a "$REPORT_FILE"
+
+        # Try TCP connection with timeout
+        if timeout 5 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1; then
+            echo "  ✔ TCP reachable" | tee -a "$REPORT_FILE"
+        else
+            echo "  ✖ Cannot connect via TCP" | tee -a "$REPORT_FILE"
+        fi
+
+        # If service exposes an HTTP health endpoint, probe it
+        if [[ "$port" =~ ^(80|443|8080|8443)$ ]]; then
+            health_url="http://${host}:${port}/health"
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" "$health_url" || echo "000")
+            echo "  HTTP health check ($health_url) → $http_code" | tee -a "$REPORT_FILE"
+        fi
+    done
+}
+
+# ------------------------------------------------------------
+# 3. Network connectivity inspection
+# ------------------------------------------------------------
+inspect_network() {
+    log_section "Network Connectivity Inspection"
+
+    # Basic reachability (ping)
+    for svc in "${BACKEND_SERVICES[@]}"; do
+        host=${svc%%:*}
+        echo "Pinging $host ..." | tee -a "$REPORT_FILE"
+        if ping -c 3 -W 2 "$host" >/dev/null 2>&1; then
+            echo "  ✔ Ping successful" | tee -a "$REPORT_FILE"
+        else
+            echo "  ✖ Ping failed" | tee -a "$REPORT_FILE"
+        fi
+    done
+
+    # Traceroute to each host (requires traceroute package)
+    for svc in "${BACKEND_SERVICES[@]}"; do
+        host=${svc%%:*}
+        echo -e "\nTraceroute to $host:" | tee -a "$REPORT_FILE"
+        if command -v traceroute >/dev/null; then
+            traceroute -n -w 2 "$host" | tail -n +2 | head -n 5 >>"$REPORT_FILE"
+        else
+            echo "  traceroute command not available" | tee -a "$REPORT_FILE"
+        fi
+    done
+}
+
+# ------------------------------------------------------------
+# 4. Request & response header examination
+# ------------------------------------------------------------
+examine_headers() {
+    log_section "Request & Response Header Examination"
+
+    # Capture live request/response headers from the endpoint
+    echo "Fetching HEAD request from $ENDPOINT_URL ..." | tee -a "$REPORT_FILE"
+    curl -s -D - -o /dev/null "$ENDPOINT_URL" >>"$REPORT_FILE"
+
+    # Compare against expected headers (define a minimal set here)
+    declare -A EXPECTED_HEADERS=(
+        ["Content-Type"]="application/json"
+        ["Cache-Control"]="no-store"
+    )
+
+    echo -e "\nHeader validation:" | tee -a "$REPORT_FILE"
+    for hdr in "${!EXPECTED_HEADERS[@]}"; do
+        value=$(curl -s -I "$ENDPOINT_URL" | grep -i "^$hdr:" | tr -d '\r')
+        if [[ -z "$value" ]]; then
+            echo "  ✖ Missing header: $hdr" | tee -a "$REPORT_FILE"
+        elif [[ "$(echo "$value" | cut -d':' -f2- | xargs)" != "${EXPECTED_HEADERS[$hdr]}" ]]; then
+            echo "  ✖ $hdr mismatch (found: $(echo "$value" | cut -d':' -f2- | xargs))" | tee -a "$REPORT_FILE"
+        else
+            echo "  ✔ $hdr OK" | tee -a "$REPORT_FILE"
+        fi
+    done
+}
+
+# ------------------------------------------------------------
+# 5. Simple codebase review (static hints)
+# ------------------------------------------------------------
+review_code() {
+    log_section "Static Code Review – Quick Scan"
+
+    # Look for common markers of unfinished work
+    run_cmd "Searching for TODO/FIXME comments" \
+        grep -RInE "(TODO|FIXME|BUG)" "$CODEBASE_DIR" || true
+
+    # Run basic syntax checkers if language is known (example for Python)
+    if command -v python3 >/dev/null && compgen -G "$CODEBASE_DIR/**/*.py" > /dev/null; then
+        run_cmd "Running pyflakes on Python sources" \
+            pyflakes "$CODEBASE_DIR"
+    fi
+
+    # Example for JavaScript/Node.js projects
+    if command -v eslint >/dev/null && [ -f "$CODEBASE_DIR/.eslintrc.js" ]; then
+        run_cmd "Running ESLint" \
+            eslint "$CODEBASE_DIR"
+    fi
+}
+
+# ------------------------------------------------------------
+# 6. System resource monitoring snapshot
+# ------------------------------------------------------------
+monitor_resources() {
+    log_section "System Resource Snapshot"
+
+    run_cmd "CPU & Memory usage (top -b -n1)" top -b -n1
+    run_cmd "Memory details (free -h)" free -h
+    run_cmd "Disk usage (df -h)" df -h
+    if command -v iostat >/dev/null; then
+        run_cmd "IO statistics (iostat -xz 1 3)" iostat -xz 1 3
+    else
+        echo "iostat not installed – skipping IO stats." | tee -a "$REPORT_FILE"
+    fi
+    run_cmd "Open file descriptors (lsof | wc -l)" sh -c "lsof | wc -l"
+}
+
+# ------------------------------------------------------------
+# 7. Load testing to surface performance bottlenecks
+# ------------------------------------------------------------
+load_test() {
+    log_section "Load Testing with ApacheBench (ab)"
+
+    if ! command -v ab >/dev/null; then
+        echo "ApacheBench (ab) not installed – skipping load test." | tee -a "$REPORT_FILE"
+        return
+    fi
+
+    echo "Running $LOAD_TEST_REQUESTS requests @ concurrency $LOAD_TEST_CONCURRENCY ..." | tee -a "$REPORT_FILE"
+    ab -n "$LOAD_TEST_REQUESTS" -c "$LOAD_TEST_CONCURRENCY" "$ENDPOINT_URL" >>"$REPORT_FILE" 2>&1
+}
+
+# ------------------------------------------------------------
+# 8. Compile findings and notify development team
+# ------------------------------------------------------------
+notify_dev_team() {
+    log_section "Notification Summary"
+
+    echo "Report generated at: $REPORT_FILE" | tee -a "$REPORT_FILE"
+    if command -v mail >/dev/null; then
+        mail -s "Error Rate Investigation Report – $(hostname)" "$DEV_TEAM_EMAIL" <"$REPORT_FILE"
+        echo "Email sent to $DEV_TEAM_EMAIL." | tee -a "$REPORT_FILE"
+    else
+        echo "Mail utility not available – please forward the report manually." | tee -a "$REPORT_FILE"
+    fi
+}
+
+# ------------------------------------------------------------
+# Main execution flow
+# ------------------------------------------------------------
+main() {
+    echo "=== Error Rate Investigation Script ===" >"$REPORT_FILE"
+    echo "Run timestamp: $(date)" >>"$REPORT_FILE"
+    echo "Host: $(hostname)" >>"$REPORT_FILE"
+    echo "-----------------------------------------" >>"$REPORT_FILE"
+
+    analyse_logs
+    check_backend_health
+    inspect_network
+    examine_headers
+    review_code
+    monitor_resources
+    load_test
+    notify_dev_team
+
+    echo -e "\nAll steps completed. Detailed report saved to $REPORT_FILE"
+}
+
+main "$@"
