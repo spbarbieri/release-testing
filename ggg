@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+#
+# Chaskin Adaptive Per‑Entity Alert Diagnostic & Mitigation Script
+# ---------------------------------------------------------------
+# This script automates the investigation steps outlined in the incident
+# response plan for the "(Copy of) Chaskin Adaptive Per‑Entity Alert".
+#
+# Prerequisites:
+#   • curl, jq, kubectl, promtool, ssh, awk, sed, python3 installed
+#   • Access tokens / credentials available via environment variables
+#
+# Usage:
+#   CHASKIN_ALERT.sh [-t <token>] [-m <monitor_url>] [-a <alert_name>]
+#                    [-p <prometheus_url>] [-r <alertmanager_url>]
+#
+# Example:
+#   CHASKIN_ALERT.sh -t "$TOKEN" -m "https://monitoring.example.com" \
+#                    -a "Chaskin Adaptive Per-Entity Alert" \
+#                    -p "http://prometheus.internal:9090" \
+#                    -r "https://alertmanager.example.com"
+
+set -euo pipefail
+
+#########################
+# Configuration defaults
+#########################
+DEFAULT_MONITOR_URL="https://monitoring.example.com"
+DEFAULT_ALERT_NAME="(Copy of) Chaskin Adaptive Per-Entity Alert"
+DEFAULT_PROMETHEUS_URL="http://prometheus.internal:9090"
+DEFAULT_ALERTMANAGER_URL="https://alertmanager.example.com"
+SILENCE_DURATION="2h"
+TMP_DIR="$(mktemp -d)"
+NOW_EPOCH="$(date +%s)"
+
+#########################
+# Helper functions
+#########################
+log() {
+    local level="$1"; shift
+    printf '[%s] %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >&2
+}
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} [-t <token>] [-m <monitor_url>] [-a <alert_name>]
+                 [-p <prometheus_url>] [-r <alertmanager_url>]
+
+Options:
+  -t  Authorization bearer token (or set env var TOKEN)
+  -m  Monitoring API base URL (default: $DEFAULT_MONITOR_URL)
+  -a  Alert name to investigate (default: "$DEFAULT_ALERT_NAME")
+  -p  Prometheus server URL (default: $DEFAULT_PROMETHEUS_URL)
+  -r  Alertmanager URL (default: $DEFAULT_ALERTMANAGER_URL)
+  -h  Show this help message
+EOF
+    exit 1
+}
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+#########################
+# Parse CLI arguments
+#########################
+while getopts ":t:m:a:p:r:h" opt; do
+    case "${opt}" in
+        t) TOKEN="${OPTARG}" ;;
+        m) MONITOR_URL="${OPTARG}" ;;
+        a) ALERT_NAME="${OPTARG}" ;;
+        p) PROMETHEUS_URL="${OPTARG}" ;;
+        r) ALERTMANAGER_URL="${OPTARG}" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# Fallback to defaults / environment vars
+TOKEN="${TOKEN:-${TOKEN:-}}"
+MONITOR_URL="${MONITOR_URL:-$DEFAULT_MONITOR_URL}"
+ALERT_NAME="${ALERT_NAME:-$DEFAULT_ALERT_NAME}"
+PROMETHEUS_URL="${PROMETHEUS_URL:-$DEFAULT_PROMETHEUS_URL}"
+ALERTMANAGER_URL="${ALERTMANAGER_URL:-$DEFAULT_ALERTMANAGER_URL}"
+
+if [[ -z "$TOKEN" ]]; then
+    log "ERROR" "Bearer token not supplied. Use -t or set \$TOKEN."
+    exit 1
+fi
+
+######################################
+# 1. Verify Alert Definition
+######################################
+fetch_alert_definition() {
+    log "INFO" "Fetching alert definition for \"$ALERT_NAME\" ..."
+    curl -sSf -H "Authorization: Bearer $TOKEN" \
+        "${MONITOR_URL}/api/v2/alerts" |
+        jq -r ".[] | select(.name | contains(\"$ALERT_NAME\"))" >"$TMP_DIR/alert_def.json"
+
+    if [[ ! -s "$TMP_DIR/alert_def.json" ]]; then
+        log "WARN" "No matching alert found."
+    else
+        log "INFO" "Alert definition saved to $TMP_DIR/alert_def.json"
+    fi
+}
+
+######################################
+# 2. Check Alert Evaluation History
+######################################
+export_alert_history() {
+    log "INFO" "Exporting recent alert firing history (last 24h)..."
+    # Assuming Splunk CLI is configured and accessible as `splunk`
+    splunk search "| savedsearch \"${ALERT_NAME}\" earliest=-24h@h latest=now" -output csv \
+        >"$TMP_DIR/chaskin_alert_history.csv"
+    log "INFO" "History CSV stored at $TMP_DIR/chaskin_alert_history.csv"
+}
+
+######################################
+# 3. Inspect Source Metrics / Events
+######################################
+query_prometheus_metric() {
+    log "INFO" "Querying Prometheus for recent chaskin_event_total rate..."
+    promtool query instant 'rate(chaskin_event_total[5m])' --server="$PROMETHEUS_URL" \
+        >"$TMP_DIR/prometheus_rate.txt"
+    log "INFO" "Prometheus query result saved to $TMP_DIR/prometheus_rate.txt"
+}
+
+######################################
+# 4. Validate Group‑By Logic Locally
+######################################
+validate_groupby() {
+    log "INFO" "Downloading a sample of raw events for grouping validation..."
+
+    # Placeholder: replace with actual extraction method.
+    # Here we assume an endpoint provides CSV of recent events.
+    EVENT_CSV_URL="${MONITOR_URL}/api/v2/events?filter=name:${ALERT_NAME}&limit=500"
+    curl -sSf -H "Authorization: Bearer $TOKEN" "$EVENT_CSV_URL" \
+        >"$TMP_DIR/chaskin_raw_events.csv"
+
+    if [[ ! -s "$TMP_DIR/chaskin_raw_events.csv" ]]; then
+        log "WARN" "Raw events file empty – skipping Python grouping step."
+        return
+    fi
+
+    log "INFO" "Running Python one‑liner to group by entity_id & event_type..."
+    python3 - <<PYTHON
+import pandas as pd, sys, os
+csv_path = os.getenv('RAW_EVENTS')
+df = pd.read_csv(csv_path)
+if {'entity_id','event_type'}.issubset(df.columns):
+    grouped = df.groupby(['entity_id','event_type']).size().reset_index(name='count')
+    print(grouped.head().to_string(index=False))
+else:
+    missing = {'entity_id','event_type'} - set(df.columns)
+    print(f"Missing columns for grouping: {missing}", file=sys.stderr)
+PYTHON
+    # Export env var for python script
+    export RAW_EVENTS="$TMP_DIR/chaskin_raw_events.csv"
+}
+
+######################################
+# 5. Examine Recent Deployments / Config Changes
+######################################
+list_recent_deployments() {
+    log "INFO" "Listing Kubernetes deployments created in the last 48h in namespace 'monitoring'..."
+    kubectl get deploy -n monitoring -o json |
+        jq -r '.items[] | select(.metadata.creationTimestamp >= "'$(date -d "-48 hours" -u +"%Y-%m-%dT%H:%M:%SZ")'") |
+                "\(.metadata.name)\t\(.metadata.creationTimestamp)"' \
+        >"$TMP_DIR/recent_deployments.tsv"
+    log "INFO" "Recent deployments written to $TMP_DIR/recent_deployments.tsv"
+}
+
+######################################
+# 6. Correlate with Infrastructure Health
+######################################
+collect_node_health() {
+    log "INFO" "Collecting CPU utilization snapshot from a representative host..."
+    HOST="host01"   # Adjust as needed or make configurable
+    ssh -o BatchMode=yes "admin@$HOST" "sar -u 1 60" >"$TMP_DIR/${HOST}_sar.txt" || true
+    log "INFO" "SAR output saved to $TMP_DIR/${HOST}_sar.txt"
+}
+
+######################################
+# 7. Review Suppression / Throttling Settings
+######################################
+review_suppression() {
+    log "INFO" "Extracting alertmanager configuration snippets related to the alert..."
+    grep -A5 -i "Chaskin Adaptive" /etc/alertmanager/config.yml \
+        >"$TMP_DIR/alertmanager_snippet.yml" || true
+    log "INFO" "Snippet saved to $TMP_DIR/alertmanager_snippet.yml"
+}
+
+######################################
+# Immediate Mitigation – Silence Alert
+######################################
+silence_alert() {
+    log "INFO" "Creating a temporary silence for \"$ALSET_NAME\" (duration: $SILENCE_DURATION)..."
+    read -r -d '' SILENCE_PAYLOAD <<EOF
+{
+  "matchers": [
+    {
+      "name": "alertname",
+      "value": "$ALERT_NAME",
+      "isRegex": false
+    }
+  ],
+  "startsAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "endsAt": "$(date -u -d "+$SILENCE_DURATION" +"%Y-%m-%dT%H:%M:%SZ")",
+  "createdBy": "chaskin-diagnostic-script",
+  "comment": "Temporary mute pending investigation"
+}
+EOF
+    RESPONSE=$(curl -sSf -X POST -H "Content-Type: application/json" \
+        -d "$SILENCE_PAYLOAD" "${ALERTMANAGER_URL}/api/v2/silences")
+    SILENCE_ID=$(echo "$RESPONSE" | jq -r .silenceID // .id // empty)
+    if [[ -n "$SILENCE_ID" ]]; then
+        log "INFO" "Silence created successfully (ID: $SILENCE_ID)."
+    else
+        log "WARN" "Silence creation response did not contain an ID. Full response:"
+        echo "$RESPONSE" >&2
+    fi
+}
+
+######################################
+# Main execution flow
+######################################
+main() {
+    fetch_alert_definition
+    export_alert_history
+    query_prometheus_metric
+    validate_groupby
+    list_recent_deployments
+    collect_node_health
+    review_suppression
+    silence_alert
+
+    log "INFO" "All diagnostics collected under $TMP_DIR"
+    log "INFO" "Review the generated files and take further remedial actions as required."
+}
+
+main "$@"
