@@ -1,296 +1,120 @@
-#!/usr/bin/env bash
-#
-# Diagnostic & Load‑Testing Script
-# ---------------------------------
-# Performs a series of automated checks to help pinpoint the root cause of a
-# sudden increase in HTTP error responses from an application endpoint.
-#
-#   1. Log analysis – extracts frequent error patterns.
-#   2. Backend health – probes configured health‑check URLs.
-#   3. Network inspection – ping/traceroute + TCP port reachability.
-#   4. Header comparison – captures request/response headers.
-#   5. Code sanity – simple static scans for obvious red flags.
-#   6. System resource snapshot – CPU, memory, disk I/O.
-#   7. Load test – runs a brief stress test (ApacheBench or wrk).
-#   8. Summary – prints next‑steps for developers.
-#
-# Adjust configuration variables below before execution.
-
+#!/bin/bash
 set -euo pipefail
 
-#############################
-# Configuration
-#############################
-# Application endpoint to test
-ENDPOINT_URL="https://api.example.com/v1/resource"
+# ----------------------------------------------------------------------
+# Script: diagnose_k8s_node.sh
+# Purpose: Diagnose a Kubernetes worker node and attempt recovery if possible.
+#
+# Steps:
+#   1. Scan kubelet logs for errors or warnings.
+#   2. If clean, verify node status via `kubectl get nodes`.
+#   3. If node is not reachable/Ready, confirm the node has a valid IP.
+#   4. If the node is reachable but still NotReady, restart the kubelet.
+# ----------------------------------------------------------------------
 
-# Directory containing log files (plain text)
-LOG_DIR="/var/log/myapp"
-# Pattern to match log files (e.g., *.log or app_*.log)
-LOG_GLOB="*.log"
+# ---------- Configuration ----------
+# Number of recent log lines to inspect (adjust as needed)
+LOG_LINES=500
 
-# Backend services – associative array of name => health‑check URL
-declare -A BACKENDS=(
-    ["auth"]="http://auth.internal.local/health"
-    ["db"]="http://db.internal.local/health"
-    ["cache"]="http://cache.internal.local/health"
-)
+# Time to wait after restarting kubelet before re‑checking status (seconds)
+RESTART_WAIT=15
 
-# Number of ICMP packets for basic connectivity test
-PING_COUNT=4
+# ---------------------------------------------------------------
 
-# Load‑test parameters (adjust to your environment)
-LOADTEST_TOOL=""          # auto‑detect (ab or wrk)
-LT_REQUESTS=2000         # total requests
-LT_CONCURRENCY=50        # concurrent workers
-LT_DURATION="30s"        # used only by wrk
-
-# Output directory for artefacts
-OUTDIR="./diagnostic_output"
-mkdir -p "$OUTDIR"
-
-#############################
-# Helper Functions
-#############################
+# Helper: print timestamped messages
 log() {
-    local level="$1"; shift
-    printf '[%s] %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*"
 }
 
-die() {
-    log "ERROR" "$*"
-    exit 1
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-#############################
-# 1. Log Analysis
-#############################
-analyze_logs() {
-    log "INFO" "Analyzing logs in ${LOG_DIR}/${LOG_GLOB}"
-    local tmpfile="${OUTDIR}/error_patterns.txt"
-
-    # Extract lines that contain typical error markers (HTTP 5xx, "ERROR", etc.)
-    # Adjust regexes according to your log format.
-    grep -Ei '(\b5[0-9]{2}\b|ERROR|Exception)' "${LOG_DIR}/${LOG_GLOB}" \
-        | sed -E 's/^[[:space:]]+//' \
-        >"$tmpfile"
-
-    if [[ ! -s "$tmpfile" ]]; then
-        log "WARN" "No error entries found in logs."
-        return
-    fi
-
-    # Summarize most common error snippets (first 120 chars)
-    awk '{ line = substr($0,1,120); print line }' "$tmpfile" \
-        | sort | uniq -c | sort -rn >"${OUTDIR}/error_summary.txt"
-
-    log "INFO" "Top error patterns written to ${OUTDIR}/error_summary.txt"
-}
-
-#############################
-# 2. Backend Health Checks
-#############################
-check_backends() {
-    log "INFO" "Checking health of backend services"
-    local result_file="${OUTDIR}/backend_health.txt"
-    : >"$result_file"
-
-    for name in "${!BACKENDS[@]}"; do
-        url="${BACKENDS[$name]}"
-        if curl -fs --max-time 5 "$url" >/dev/null; then
-            echo "$name OK ($url)" >>"$result_file"
-            log "INFO" "Backend $name healthy"
-        else
-            echo "$name FAIL ($url)" >>"$result_file"
-            log "WARN" "Backend $name unreachable"
-        fi
-    done
-
-    log "INFO" "Backend health report saved to $result_file"
-}
-
-#############################
-# 3. Network Connectivity
-#############################
-inspect_network() {
-    log "INFO" "Inspecting network connectivity"
-    local net_report="${OUTDIR}/network_connectivity.txt"
-    : >"$net_report"
-
-    # Ping each backend host
-    for name in "${!BACKENDS[@]}"; do
-        host=$(echo "${BACKENDS[$name]}" | awk -F[/:] '{print $4}')
-        log "DEBUG" "Pinging $host for $name"
-        if ping -c "$PING_COUNT" -W 2 "$host" >/dev/null 2>&1; then
-            echo "$name ($host): PING OK" >>"$net_report"
-        else
-            echo "$name ($host): PING FAILED" >>"$net_report"
-        fi
-
-        # TCP port check (default to 80/443 based on scheme)
-        scheme=$(echo "${BACKENDS[$name]}" | awk -F:// '{print $1}')
-        port=$([ "$scheme" == "https" ] && echo 443 || echo 80)
-        if command_exists nc; then
-            if nc -z -w5 "$host" "$port" >/dev/null 2>&1; then
-                echo "$name ($host:$port): PORT OPEN" >>"$net_report"
-            else
-                echo "$name ($host:$port): PORT CLOSED" >>"$net_report"
-            fi
-        fi
-    done
-
-    # Traceroute to primary endpoint
-    if command_exists traceroute; then
-        traceroute -n -w 2 "$(awk -F[/:] '{print $4}' <<<"$ENDPOINT_URL")" \
-            >"${OUTDIR}/traceroute_to_endpoint.txt" 2>/dev/null || true
-    fi
-
-    log "INFO" "Network diagnostics saved to $net_report"
-}
-
-#############################
-# 4. Request/Response Headers
-#############################
-capture_headers() {
-    log "INFO" "Capturing request and response headers for $ENDPOINT_URL"
-    local hdr_file="${OUTDIR}/endpoint_headers.txt"
-
-    # Show request headers sent by curl (-v) and response headers (-D)
-    curl -s -D - -o /dev/null -X GET "$ENDPOINT_URL" >"$hdr_file" 2>/dev/null
-
-    log "INFO" "Headers stored at $hdr_file"
-}
-
-#############################
-# 5. Simple Code Review Scan
-#############################
-scan_code() {
-    log "INFO" "Scanning source tree for common pitfalls"
-    local src_dir="/opt/myapp/src"
-    local scan_out="${OUTDIR}/code_scan.txt"
-
-    if [[ ! -d "$src_dir" ]]; then
-        log "WARN" "Source directory $src_dir not found – skipping code scan"
-        return
-    fi
-
-    # Look for TODO/FIXME, empty catch blocks, and hard‑coded credentials
-    grep -RInE '(TODO|FIXME|BUG|password\s*=|secret\s*=)' "$src_dir" \
-        >"$scan_out" || true
-
-    log "INFO" "Code scan results saved to $scan_out"
-}
-
-#############################
-# 6. System Resource Snapshot
-#############################
-snapshot_resources() {
-    log "INFO" "Collecting system resource metrics"
-    local res_file="${OUTDIR}/resource_snapshot.txt"
-    {
-        echo "=== DATE === $(date)"
-        echo "--- CPU ---"
-        if command_exists mpstat; then
-            mpstat 1 1
-        else
-            top -bn1 | head -n 5
-        fi
-        echo "--- MEMORY ---"
-        free -h
-        echo "--- DISK I/O ---"
-        if command_exists iostat; then
-            iostat -xz 1 1
-        else
-            df -hT
-        fi
-        echo "--- NETWORK STATISTICS ---"
-        if command_exists ss; then
-            ss -s
-        else
-            netstat -s
-        fi
-    } >"$res_file"
-
-    log "INFO" "Resource snapshot written to $res_file"
-}
-
-#############################
-# 7. Load Testing
-#############################
-run_load_test() {
-    log "INFO" "Running lightweight load test against $ENDPOINT_URL"
-
-    # Detect preferred tool
-    if command_exists ab; then
-        LOADTEST_TOOL="ab"
-    elif command_exists wrk; then
-        LOADTEST_TOOL="wrk"
+# 1️⃣ Check kubelet logs for errors or warnings
+log "Scanning kubelet logs for errors/warnings..."
+if command -v journalctl >/dev/null 2>&1; then
+    LOG_OUTPUT=$(journalctl -u kubelet -n "${LOG_LINES}" 2>/dev/null || true)
+else
+    # Fallback to traditional logfile location
+    LOG_FILE="/var/log/kubelet.log"
+    if [[ -f "${LOG_FILE}" ]]; then
+        LOG_OUTPUT=$(tail -n "${LOG_LINES}" "${LOG_FILE}")
     else
-        log "WARN" "Neither 'ab' nor 'wrk' is installed – skipping load test"
-        return
+        LOG_OUTPUT=""
     fi
+fi
 
-    local lt_out="${OUTDIR}/load_test_result.txt"
+ERRORS=$(printf '%s\n' "${LOG_OUTPUT}" | grep -iE '(error|warning)' || true)
 
-    case "$LOADTEST_TOOL" in
-        ab)
-            ab -n "$LT_REQUESTS" -c "$LT_CONCURRENCY" -s 60 "$ENDPOINT_URL" \
-               >"$lt_out" 2>&1
-            ;;
-        wrk)
-            wrk -t"$LT_CONCURRENCY" -c"$LT_CONCURRENCY" -d"$LT_DURATION" "$ENDPOINT_URL" \
-               >"$lt_out" 2>&1
-            ;;
-    esac
+if [[ -n "${ERRORS}" ]]; then
+    log "⚠️  Errors or warnings detected in kubelet logs:"
+    printf '%s\n' "${ERRORS}"
+    exit 1
+fi
+log "✅ No errors or warnings found in recent kubelet logs."
 
-    log "INFO" "Load test completed – results in $lt_out"
-}
+# 2️⃣ Verify node status via kubectl
+if ! command -v kubectl >/dev/null 2>&1; then
+    log "❌ kubectl command not found. Install kubectl and configure access."
+    exit 1
+fi
 
-#############################
-# 8. Summary & Next Steps
-#############################
-summarise_findings() {
-    cat <<EOF
+NODE_NAME="$(hostname)"
+log "Checking status of node '${NODE_NAME}' with kubectl..."
+# Retrieve the Ready condition value (True/False/Unknown)
+READY_STATUS=$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
 
-===== DIAGNOSTIC SUMMARY =====
+if [[ -z "${READY_STATUS}" ]]; then
+    log "❌ Node '${NODE_NAME}' not listed in kubectl output or unable to query."
+    exit 1
+fi
 
-Logs:           ${OUTDIR}/error_summary.txt
-Backends:       ${OUTDIR}/backend_health.txt
-Network:        ${OUTDIR}/network_connectivity.txt
-Headers:        ${OUTDIR}/endpoint_headers.txt
-Code Scan:      ${OUTDIR}/code_scan.txt
-Resources:      ${OUTDIR}/resource_snapshot.txt
-Load Test:      ${OUTDIR}/load_test_result.txt
+if [[ "${READY_STATUS}" == "True" ]]; then
+    log "✅ Node '${NODE_NAME}' is Ready. No further action required."
+    exit 0
+fi
 
-Please review the above artifacts and discuss findings with the development team.
-Typical next actions:
-  • Correlate frequent error patterns with recent deployments.
-  • Verify failed backend health checks and restart affected services.
-  • Address any header mismatches (e.g., missing auth tokens, wrong Content-Type).
-  • Investigate resource saturation indicated in the snapshot.
-  • Optimize code paths highlighted by the load test (high latency, errors).
+log "🔎 Node '${NODE_NAME}' is not Ready (Status=${READY_STATUS}). Proceeding with deeper checks."
 
-EOF
-}
+# 3️⃣ Confirm network connectivity – ensure a non‑loopback IP exists
+log "Inspecting network interfaces for a usable IP address..."
+# List IPv4 addresses that are UP, not loopback, and have global scope
+IP_ADDRESSES=$(ip -4 -brief addr show up primary scope global | awk '{print $3}')
 
-#############################
-# Main Execution Flow
-#############################
-main() {
-    log "INFO" "Starting diagnostic routine"
-    analyze_logs
-    check_backends
-    inspect_network
-    capture_headers
-    scan_code
-    snapshot_resources
-    run_load_test
-    summarise_findings
-    log "INFO" "Diagnostic routine finished"
-}
+if [[ -z "${IP_ADDRESSES}" ]]; then
+    log "❌ No global IPv4 address detected on this node. Network configuration may be broken."
+    exit 1
+fi
 
-main "$@"
+log "✅ Detected IP address(es): ${IP_ADDRESSES}"
+
+# Optional: ping the API server to double‑check reachability (skip if unknown)
+API_SERVER="${KUBE_APISERVER:-$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)}"
+if [[ -n "${API_SERVER}" ]]; then
+    API_HOST=$(echo "${API_SERVER}" | sed -E 's~https?://([^:/]+).*~\1~')
+    log "Pinging Kubernetes API server (${API_HOST})..."
+    if ping -c 3 -W 2 "${API_HOST}" >/dev/null 2>&1; then
+        log "✅ API server reachable."
+    else
+        log "⚠️  Unable to reach API server at ${API_HOST}. Verify firewall/routing."
+    fi
+fi
+
+# 4️⃣ Restart kubelet if node is still in a bad condition
+if command -v systemctl >/dev/null 2>&1; then
+    log "Attempting to restart kubelet service..."
+    sudo systemctl restart kubelet
+    log "Waiting ${RESTART_WAIT}s for kubelet to settle..."
+    sleep "${RESTART_WAIT}"
+else
+    log "❌ systemctl not available. Cannot restart kubelet automatically."
+    exit 1
+fi
+
+# Re‑evaluate node status after restart
+log "Re‑checking node status post‑restart..."
+NEW_READY_STATUS=$(kubectl get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+
+if [[ "${NEW_READY_STATUS}" == "True" ]]; then
+    log "🎉 Success! Node '${NODE_NAME}' is now Ready."
+    exit 0
+else
+    log "🚨 Node '${NODE_NAME}' remains NotReady (Status=${NEW_READY_STATUS}). Manual investigation required."
+    exit 2
+fi
