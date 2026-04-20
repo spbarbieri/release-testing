@@ -1,0 +1,104 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: k8s_node_diagnose.sh
+# Purpose: Diagnose a Kubernetes worker node for common issues:
+#   1. Scan node logs for errors or warnings.
+#   2. Verify node status via `kubectl get nodes`.
+#   3. Confirm network interface has an IP address.
+#   4. Restart kubelet if the node is reachable but unhealthy.
+# ------------------------------------------------------------
+
+#--- Configuration -------------------------------------------------
+# Adjust these paths/commands if your environment differs.
+KUBELET_UNIT="kubelet"
+LOG_TIMEFRAME="15m"          # Look back this far when scanning logs.
+KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
+IP_CMD="ip"
+
+#--- Helper Functions ----------------------------------------------
+
+log() {
+    local level="$1"; shift
+    printf "[%s] %s\n" "$level" "$*"
+}
+
+run_cmd() {
+    # Execute a command, capturing stdout/stderr.
+    # Arguments: command array
+    "${@}"
+}
+
+#--- Step 1: Check logs for errors or warnings ---------------------
+
+log "INFO" "Scanning ${KUBELET_UNIT} logs for errors or warnings (last ${LOG_TIMEFRAME})..."
+if journalctl -u "${KUBELET_UNIT}" --since "-${LOG_TIMEFRAME}" -p warning --no-pager | grep -q .; then
+    log "WARN" "Found warnings or errors in ${KUBELET_UNIT} logs:"
+    journalctl -u "${KUBELET_UNIT}" --since "-${LOG_TIMEFRAME}" -p warning --no-pager
+    exit 0
+else
+    log "INFO" "No warnings or errors detected in recent ${KUBELET_UNIT} logs."
+fi
+
+#--- Step 2: Verify node status via kubectl -----------------------
+
+NODE_NAME="$(hostname)"
+log "INFO" "Checking node status for '${NODE_NAME}' via ${KUBECTL_BIN}..."
+
+# Capture node list; fail gracefully if kubectl cannot connect.
+if ! NODES_OUTPUT=$(${KUBECTL_BIN} get nodes -o wide 2>/dev/null); then
+    log "ERROR" "Unable to communicate with the Kubernetes API server. Ensure kubectl is configured correctly."
+    exit 1
+fi
+
+# Extract the line corresponding to this node.
+NODE_LINE=$(printf "%s\n" "${NODES_OUTPUT}" | awk -v n="${NODE_NAME}" '$1==n')
+if [[ -z "${NODE_LINE}" ]]; then
+    log "ERROR" "Node '${NODE_NAME}' not present in 'kubectl get nodes' output. It may be unreachable from the master."
+    REACHABLE=false
+else
+    NODE_STATUS=$(printf "%s\n" "${NODE_LINE}" | awk '{print $2}')
+    log "INFO" "Node status reported as '${NODE_STATUS}'."
+    REACHABLE=true
+fi
+
+#--- Step 3: Network connectivity check (if node not listed) -----
+
+if [[ "${REACHABLE}" = false ]]; then
+    log "INFO" "Inspecting network interfaces on the node..."
+    IP_INFO=$(${IP_CMD} -4 addr show scope global up)
+    if printf "%s\n" "${IP_INFO}" | grep -q "inet "; then
+        log "INFO" "Network interfaces have IPv4 addresses assigned."
+    else
+        log "ERROR" "No IPv4 address found on any non‑loopback interface. Check network configuration."
+        exit 1
+    fi
+    # After confirming IP presence, advise user to investigate further.
+    log "WARN" "Node is still not visible to the control plane despite having an IP. Manual investigation required."
+    exit 0
+fi
+
+#--- Step 4: Restart kubelet if node is reachable but not Ready ----
+
+if [[ "${NODE_STATUS}" != "Ready" ]]; then
+    log "WARN" "Node status is not Ready. Attempting to restart ${KUBELET_UNIT} service..."
+    if run_cmd sudo systemctl restart "${KUBELET_UNIT}"; then
+        log "INFO" "${KUBELET_UNIT} restarted successfully. Waiting briefly before rechecking status..."
+        sleep 10
+        NEW_STATUS=$(${KUBECTL_BIN} get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+        if [[ "${NEW_STATUS}" == "True" ]]; then
+            log "SUCCESS" "Node '${NODE_NAME}' is now Ready."
+        else
+            log "ERROR" "Node '${NODE_NAME}' remains not Ready after restarting ${KUBELET_UNIT}. Further troubleshooting needed."
+            exit 1
+        fi
+    else
+        log "ERROR" "Failed to restart ${KUBELET_UNIT}. Ensure you have sufficient privileges."
+        exit 1
+    fi
+else
+    log "SUCCESS" "Node '${NODE_NAME}' is Healthy (Ready). No action required."
+fi
+
+exit 0
