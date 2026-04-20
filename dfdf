@@ -1,0 +1,76 @@
+#!/bin/bash
+set -euo pipefail
+
+# ----------------------------------------------------------------------
+# Script: manual_action.sh
+# Purpose: Prompt the operator to enter free‑form text describing an
+#          action, tag it as type "Manual", and store the result in a
+#          timestamped file.
+#
+# Usage:   ./manual_action.sh [output_directory]
+#
+# If no output directory is supplied, the current working directory is used.
+# ----------------------------------------------------------------------
+
+# ---- Configuration ----------------------------------------------------
+DEFAULT_OUTPUT_DIR="."
+TIMESTAMP_FORMAT="%Y%m%d_%H%M%S"
+OUTPUT_PREFIX="action_manual"
+
+# ---- Helper Functions -------------------------------------------------
+usage() {
+    echo "Usage: $0 [output_directory]"
+    exit 1
+}
+
+error_exit() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+# ---- Parse Arguments --------------------------------------------------
+if [[ $# -gt 1 ]]; then
+    usage
+fi
+
+OUTPUT_DIR="${1:-$DEFAULT_OUTPUT_DIR}"
+
+# Validate output directory
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    error_exit "Output directory '$OUTPUT_DIR' does not exist."
+fi
+
+# Ensure we have write permission
+if [[ ! -w "$OUTPUT_DIR" ]]; then
+    error_exit "No write permission for directory '$OUTPUT_DIR'."
+fi
+
+# ---- Main Logic -------------------------------------------------------
+echo "=== Manual Action Entry ==="
+echo "Please type the description for the action below."
+echo "Press Ctrl+D (EOF) when finished."
+echo ""
+
+# Read multiline input from stdin until EOF
+MANUAL_TEXT=$(cat)
+
+# Verify that some content was entered
+if [[ -z "${MANUAL_TEXT//[$'\t\r\n ']}" ]]; then
+    error_exit "No input received. Exiting."
+fi
+
+# Build output filename
+CURRENT_TS=$(date +"$TIMESTAMP_FORMAT")
+OUTFILE="${OUTPUT_DIR}/${OUTPUT_PREFIX}_${CURRENT_TS}.txt"
+
+# Write metadata and user-provided text to the file
+{
+    echo "# Action Type: Manual"
+    echo "# Timestamp : $(date --iso-8601=seconds)"
+    echo ""
+    echo "$MANUAL_TEXT"
+} >"$OUTFILE"
+
+echo ""
+echo "Action saved to: $OUTFILE"
+echo "Script completed successfully."
