@@ -1,3 +1,220 @@
 #!/bin/bash
+# ==============================================================================
+# Script: jvm_event_diagnostics.sh
+# Purpose: Automate data collection, verification, and initial analysis for the
+#          repetitive “New event Event New event with description ss”
+#          messages observed in JVM logs.
+# Author: Automated Generation
+# ==============================================================================
 
-systemctl restart <service_name>
+set -euo pipefail
+
+# ------------------------------- Configuration --------------------------------
+# Service name whose logs are inspected – can be overridden via CLI argument.
+SERVICE_NAME="${1:-myapp}"
+
+# Base directory where all artifacts will be stored.
+BASE_OUTDIR="/tmp/jvm_event_analysis_$(date +%Y%m%d_%H%M%S)"
+
+# Source code location (adjust if different).
+SRC_ROOT="/opt/app/src"
+
+# Number of seconds between successive vmstat samples.
+VMSTAT_INTERVAL=1
+VMSTAT_COUNT=5
+
+# ---------------------------------------------------------------------------
+
+# Create output hierarchy.
+mkdir -p "${BASE_OUTDIR}/logs"
+mkdir -p "${BASE_OUTDIR}/jvm_info"
+mkdir -p "${BASE_OUTDIR}/diagnostics"
+mkdir -p "${BASE_OUTDIR}/code_search"
+mkdir -p "${BASE_OUTDIR}/git_history"
+
+echo "[+] Output directory created at ${BASE_OUTDIR}"
+
+# ---------------------------- Initial Data Collection -------------------------
+
+# 1. Recent journal entries for the target service.
+echo "[*] Collecting recent journalctl entries..."
+journalctl -u "${SERVICE_NAME}" --since "5 minutes ago" \
+    > "${BASE_OUTDIR}/logs/journal_${SERVICE_NAME}.log" 2>/dev/null || true
+
+# 2. List Java processes (jps) and detailed JVM command lines (jcmd).
+echo "[*] Capturing JVM process list (jps)..."
+jps -l > "${BASE_OUTDIR}/jvm_info/jps.txt"
+
+echo "[*] Capturing JVM command line details (jcmd)..."
+jcmd -l > "${BASE_OUTDIR}/jvm_info/jcmd_l.txt"
+
+# Extract PIDs of Java processes belonging to the service (heuristic based on cmdline).
+declare -a JAVA_PIDS=()
+while IFS= read -r line; do
+    pid=$(awk '{print $1}' <<<"$line")
+    cmd=$(awk '{$1=""; print $0}' <<<"$line")
+    if [[ "$cmd" == *"${SERVICE_NAME}"* ]]; then
+        JAVA_PIDS+=("$pid")
+    fi
+done < "${BASE_OUTDIR}/jvm_info/jps.txt"
+
+if [ ${#JAVA_PIDS[@]} -eq 0 ]; then
+    echo "[!] No Java PID matched the service name '${SERVICE_NAME}'. Falling back to all Java PIDs."
+    mapfile -t JAVA_PIDS < <(awk '{print $1}' "${BASE_OUTDIR}/jvm_info/jps.txt")
+fi
+
+echo "[+] Identified Java PIDs: ${JAVA_PIDS[*]}"
+
+# 3. For each PID, collect version, build, heap, GC, stack, and runtime stats.
+for pid in "${JAVA_PIDS[@]}"; do
+    PID_DIR="${BASE_OUTDIR}/jvm_info/pid_${pid}"
+    mkdir -p "${PID_DIR}"
+
+    echo "[*] Gathering JVM version for PID ${pid}..."
+    jcmd "${pid}" VM.version > "${PID_DIR}/version.txt" 2>/dev/null || true
+
+    echo "[*] Gathering JVM flags for PID ${pid}..."
+    jcmd "${pid}" VM.command_line > "${PID_DIR}/flags.txt" 2>/dev/null || true
+
+    echo "[*] Dumping heap summary for PID ${pid}..."
+    jmap -heap "${pid}" > "${PID_DIR}/heap.txt" 2>/dev/null || true
+
+    echo "[*] Capturing thread dump for PID ${pid}..."
+    jstack -l "${pid}" > "${PID_DIR}/thread_dump.txt" 2>/dev/null || true
+
+    echo "[*] Recording GC utilization (jstat) for PID ${pid}..."
+    # Run jstat once with a 1s interval; timeout after 2 seconds to avoid hanging.
+    timeout 2 jstat -gcutil "${pid}" 1000 > "${PID_DIR}/jstat_gcutil.txt" 2>/dev/null || true
+
+    echo "[*] Saving current top snapshot..."
+    top -b -n 1 > "${BASE_OUTDIR}/diagnostics/top_snapshot.txt"
+
+    echo "[*] Running vmstat (${VMSTAT_COUNT} samples)..."
+    vmstat "${VMSTAT_INTERVAL}" "${VMSTAT_COUNT}" > "${BASE_OUTDIR}/diagnostics/vmstat.txt"
+
+    # Optional: capture process-specific CPU/memory via ps
+    echo "[*] Capturing ps metrics for PID ${pid}..."
+    ps -p "${pid}" -o %cpu,%mem,rss,vsz,etime,cmd > "${PID_DIR}/ps_metrics.txt"
+done
+
+# -------------------------- Symptom Verification ------------------------------
+
+# The collected top/vmstat/jstat/thread dumps provide a baseline for manual
+# correlation with the timestamps of the noisy log messages.
+
+# -------------------------- Root Cause Preliminary Checks --------------------
+
+# 1. Search source tree for the literal string used in the log message.
+echo "[*] Searching source code for the event string..."
+grep -R "Event New event" "${SRC_ROOT}" > "${BASE_OUTDIR}/code_search/grep_Event_New_event.txt" 2>/dev/null || true
+
+# 2. Search for the short token “ss” which might be part of the description.
+echo "[*] Searching source code for token \"ss\"..."
+grep -R "\"ss\"" "${SRC_ROOT}" > "${BASE_OUTDIR}/code_search/grep_ss.txt" 2>/dev/null || true
+
+# 3. Git history inspection for recent changes related to events.
+if command -v git >/dev/null 2>&1 && [ -d "${SRC_ROOT}/.git" ]; then
+    echo "[*] Pulling latest git tags/branches..."
+    pushd "${SRC_ROOT}" >/dev/null
+    git fetch --all --quiet
+    echo "[*] Listing commits containing the word \"event\" in the last 30 days..."
+    git log -p --since='30 days ago' --grep="event" > "${BASE_OUTDIR}/git_history/git_log_event.txt"
+    popd >/dev/null
+else
+    echo "[!] Git not available or ${SRC_ROOT} is not a repository. Skipping git analysis."
+fi
+
+# -------------------------- Remediation Guidance ------------------------------
+
+cat <<EOF > "${BASE_OUTDIR}/remediation_steps.txt"
+=== Remediation Guidance ===
+
+1. Application Code Origin
+   - Locate the logging call identified by the source search results.
+   - Verify its log level (DEBUG/TRACE). Consider lowering to INFO or disabling in prod.
+   - Rebuild/redeploy after adjusting the logger configuration.
+
+2. Monitoring/Agent Misconfiguration
+   - Identify any attached agents (e.g., New Relic, Dynatrace) that emit custom events.
+   - Review their config files under /etc/<agent>/ or environment variables.
+   - Suppress the specific event type or upgrade the agent to a newer version.
+
+3. JVM Internal Diagnostics
+   - Examine the JVM flags captured in VM.command_line for diagnostic options such as:
+       -XX:+UnlockDiagnosticVMOptions
+       -XX:+PrintGCDetails
+   - Remove or disable unnecessary diagnostic flags (e.g., replace with -XX:-PrintGCDetails).
+
+After applying changes, restart the service:
+
+    sudo systemctl restart ${SERVICE_NAME}
+
+Validate the fix by monitoring logs for at least 24 hours.
+
+EOF
+
+# ------------------------------ Validation -----------------------------------
+
+# Tail the application log (assumes typical path; adjust if necessary)
+APP_LOG="/var/log/${SERVICE_NAME}/application.log"
+if [ -f "${APP_LOG}" ]; then
+    echo "[*] Starting live tail of ${APP_LOG} (press Ctrl+C to stop)..."
+    # Run tail in background and redirect to a file for later review.
+    tail -F "${APP_LOG}" > "${BASE_OUTDIR}/validation/tail_${SERVICE_NAME}.log" &
+    TAIL_PID=$!
+else
+    echo "[!] Application log ${APP_LOG} not found. Skipping live tail."
+fi
+
+# Short-term performance snapshot post‑restart (optional)
+echo "[*] Capturing sar snapshot (CPU) for quick sanity check..."
+if command -v sar >/dev/null 2>&1; then
+    sar -u 1 10 > "${BASE_OUTDIR}/validation/sar_cpu.txt"
+else
+    echo "[!] sar utility not installed. Install sysstat package to enable."
+fi
+
+# Allow user to terminate tail manually; cleanup background job.
+if [ -n "${TAIL_PID-}" ]; then
+    wait "${TAIL_PID}" 2>/dev/null || true
+fi
+
+# --------------------------- Preventive Measures -----------------------------
+
+cat <<EOF > "${BASE_OUTDIR}/preventive_measures.txt"
+=== Preventive Measures ===
+
+- Central Logging Filter:
+    Add a rule to Logstash/Fluentd to drop messages matching
+    "New event Event New event with description ss".
+
+- Test Coverage:
+    Introduce unit/integration test asserting that no log entry contains
+    the above phrase under normal workload.
+
+- Documentation:
+    Record this incident, root cause, and remediation steps in the incident
+    tracking system (e.g., Jira ticket) and update the runbook.
+
+EOF
+
+# ----------------------------- Summary ---------------------------------------
+
+echo ""
+echo "===== Diagnostic Run Complete ====="
+echo "All artifacts saved under: ${BASE_OUTDIR}"
+echo "Review the following key files:"
+echo "  - logs/journal_${SERVICE_NAME}.log"
+echo "  - jvm_info/jps.txt"
+echo "  - jvm_info/pid_<PID>/thread_dump.txt"
+echo "  - code_search/grep_Event_New_event.txt"
+echo "  - remediation_steps.txt"
+echo "  - preventive_measures.txt"
+echo ""
+echo "Next steps:"
+echo "  1. Analyse the source/code search results to pinpoint the origin."
+echo "  2. Apply the appropriate remediation guidance."
+echo "  3. Restart the service and monitor logs for 24h."
+echo "===================================="
+
+exit 0
