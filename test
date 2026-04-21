@@ -1,128 +1,192 @@
 #!/bin/bash
+#
+# Diagnostic script for repeated “New event Event New event with description ss”
+# messages in JVM logs. It collects environment information, runtime metrics,
+# source references and prepares artefacts for root‑cause analysis.
+#
+# Usage: ./jvm_event_diag.sh <service_name>
+#
+# All collected data is stored under /tmp/jvm_event_diag_<timestamp>/.
+
 set -euo pipefail
 
-# ------------------------------------------------------------
-# Script: diagnose_k8s_node.sh
-# Purpose: Diagnose common issues on a Kubernetes worker node.
-# Steps:
-#   1) Scan recent kubelet logs for errors or warnings.
-#   2) Verify node status via 'kubectl get nodes'.
-#   3) If node is NotReady, confirm the node has a valid IP address.
-#   4) If the node is reachable but still unhealthy, restart kubelet.
-# ------------------------------------------------------------
+###############################
+# Helper functions
+###############################
 
-# Configurable parameters
-LOG_LOOKBACK="1h"               # How far back to search logs (compatible with journalctl)
-KUBELET_UNIT="kubelet"
-MAX_LOG_LINES=1000              # Limit lines processed when searching logs
-IP_INTERFACE_REGEX='^[0-9]+:'   # Pattern to identify interface entries in ip addr output
+log_msg() {
+    local lvl="$1"
+    shift
+    printf '[%s] %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$lvl" "$*" >&2
+}
 
-# Helper functions ------------------------------------------------
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
-}
-err() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*" >&2
-}
 die() {
-    err "$@"
+    log_msg "ERROR" "$@"
     exit 1
 }
 
-# 1) Check kubelet logs for errors or warnings -----------------
-log "Scanning recent ${KUBELET_UNIT} logs for errors or warnings..."
-if ! command -v journalctl >/dev/null 2>&1; then
-    die "journalctl not found – cannot read systemd logs."
-fi
+usage() {
+    cat <<EOF
+Usage: $0 <service_name>
 
-# Capture relevant log lines (limit to avoid huge output)
-log_output=$(journalctl -u "${KUBELET_UNIT}" --since="${LOG_LOOKBACK}" -n "${MAX_LOG_LINES}" || true)
-
-if [[ -z "${log_output}" ]]; then
-    log "No recent ${KUBELET_UNIT} logs found."
-else
-    # Search case‑insensitively for typical keywords
-    if echo "${log_output}" | grep -iE 'error|warn|failed|panic' >/dev/null; then
-        err "Found error/warning entries in ${KUBELET_UNIT} logs:"
-        echo "${log_output}" | grep -iE 'error|warn|failed|panic'
-        exit 1
-    else
-        log "No error or warning messages detected in recent logs."
-    fi
-fi
-
-# 2) Verify node status via kubectl -----------------------------
-if ! command -v kubectl >/dev/null 2>&1; then
-    die "kubectl not installed or not in PATH."
-fi
-
-NODE_NAME="$(hostname)"
-log "Checking node '${NODE_NAME}' status with 'kubectl get nodes'..."
-
-# Get the line corresponding to this node
-node_line=$(kubectl get nodes "${NODE_NAME}" --no-headers 2>/dev/null || true)
-
-if [[ -z "${node_line}" ]]; then
-    err "Node '${NODE_NAME}' not listed in 'kubectl get nodes'. It may be unreachable from the control plane."
-    REACHABLE=false
-else
-    # Expected columns: NAME STATUS ... ; we care about the second column
-    NODE_STATUS=$(awk '{print $2}' <<<"${node_line}")
-    log "Node status reported as '${NODE_STATUS}'."
-
-    if [[ "${NODE_STATUS}" == "Ready" ]]; then
-        log "Node is healthy. No further action required."
-        exit 0
-    else
-        log "Node is not Ready (status: ${NODE_STATUS}). Proceeding with deeper checks."
-        REACHABLE=true
-    fi
-fi
-
-# 3) If node not reachable, verify it has a usable IP address --
-if [[ "${REACHABLE:-true}" = false ]]; then
-    log "Verifying network configuration on the node..."
-    if ! command -v ip >/dev/null 2>&1; then
-        die "'ip' command not available."
-    fi
-
-    ip_info=$(ip -brief addr show)
-    # Filter out loopback and down interfaces
-    usable_ip=$(echo "${ip_info}" |
-                awk '$3 != "LOOPBACK" && $3 != "DOWN" {for(i=3;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' |
-                head -n1 || true)
-
-    if [[ -z "${usable_ip}" ]]; then
-        err "No non‑loopback IPv4 address found on this node. Network misconfiguration suspected."
-        exit 1
-    else
-        log "Detected IP address ${usable_ip}. Node appears to have networking; issue may lie elsewhere."
-    fi
-fi
-
-# 4) Node reachable but still unhealthy → restart kubelet ----------
-log "Attempting to restart the kubelet service to recover node health..."
-if ! command -v systemctl >/dev/null 2>&1; then
-    die "systemctl not found – cannot manage services."
-fi
-
-sudo systemctl restart "${KUBELET_UNIT}"
-log "kubelet restarted. Waiting briefly for it to settle..."
-sleep 10
-
-# Re‑check node status after restart
-log "Re‑checking node status post‑restart..."
-node_line_post=$(kubectl get nodes "${NODE_NAME}" --no-headers 2>/dev/null || true)
-if [[ -z "${node_line_post}" ]]; then
-    err "Node still not visible to the control plane after kubelet restart."
+<service_name>   Systemd unit name of the Java application (e.g. myapp.service)
+EOF
     exit 1
-fi
-POST_STATUS=$(awk '{print $2}' <<<"${node_line_post}")
+}
 
-if [[ "${POST_STATUS}" == "Ready" ]]; then
-    log "Node status is now Ready. Issue resolved."
-    exit 0
-else
-    err "Node remains in status '${POST_STATUS}' after kubelet restart."
-    exit 1
+###############################
+# Argument validation
+###############################
+
+if [[ $# -ne 1 ]]; then
+    usage
 fi
+
+SERVICE_NAME="${1}"
+OUTPUT_ROOT="/tmp/jvm_event_diag_$(date '+%Y%m%d_%H%M%S')"
+
+mkdir -p "${OUTPUT_ROOT}"
+log_msg "INFO" "Created output directory ${OUTPUT_ROOT}"
+
+###############################
+# Section 1 – Initial Data Collection
+###############################
+
+log_msg "INFO" "Collecting JVM process list (jps -l)"
+jps -l >"${OUTPUT_ROOT}/jps_l.txt"
+
+# Extract Java PIDs (first column) – ignore header lines
+JAVA_PIDS=($(awk '{print $1}' "${OUTPUT_ROOT}/jps_l.txt"))
+if [[ ${#JAVA_PIDS[@]} -eq 0 ]]; then
+    die "No Java processes found on this host."
+fi
+log_msg "INFO" "Found ${#JAVA_PIDS[@]} Java process(es): ${JAVA_PIDS[*]}"
+
+# Store detailed jcmd info for each PID
+for pid in "${JAVA_PIDS[@]}"; do
+    log_msg "INFO" "Running jcmd for PID ${pid}"
+    jcmd -J-Dcom.sun.management.jmxremote.port=0 -l "${pid}" >"${OUTPUT_ROOT}/jcmd_${pid}_l.txt" 2>&1 || true
+done
+
+log_msg "INFO" "Fetching recent journal entries for ${SERVICE_NAME}"
+journalctl -u "${SERVICE_NAME}" --since "5 minutes ago" >"${OUTPUT_ROOT}/journal_${SERVICE_NAME}.log"
+
+log_msg "INFO" "Capturing JVM version/build details"
+for pid in "${JAVA_PIDS[@]}"; do
+    # Using jcmd VM.version if available, fallback to java -version via proc exe link
+    if command -v jcmd >/dev/null; then
+        jcmd "${pid}" VM.version >"${OUTPUT_ROOT}/jvm_version_${pid}.txt" 2>&1 || true
+    else
+        readlink -f "/proc/${pid}/exe" | xargs -I{} sh -c '{} -version' >"${OUTPUT_ROOT}/jvm_version_${pid}.txt" 2>&1 || true
+    fi
+done
+
+log_msg "INFO" "Listing deployed applications & libraries (classpath inspection)"
+for pid in "${JAVA_PIDS[@]}"; do
+    jcmd "${pid}" VM.command_line >"${OUTPUT_ROOT}/classpath_${pid}.txt" 2>&1 || true
+done
+
+###############################
+# Section 2 – Symptom Verification
+###############################
+
+log_msg "INFO" "Snapshot of system-wide CPU/memory (top -b -n 1)"
+top -b -n 1 >"${OUTPUT_ROOT}/top_snapshot.txt"
+
+log_msg "INFO" "Collecting vmstat samples (1 sec interval, 5 samples)"
+vmstat 1 5 >"${OUTPUT_ROOT}/vmstat.txt"
+
+# Per‑PID GC utilization over 1‑second intervals (repeat 5 times)
+for pid in "${JAVA_PIDS[@]}"; do
+    log_msg "INFO" "Gathering GC util for PID ${pid} (5 samples, 1s apart)"
+    jstat -gcutil "${pid}" 1000 5 >"${OUTPUT_ROOT}/jstat_gcutil_${pid}.txt" 2>&1 || true
+done
+
+# Thread dump for each PID
+for pid in "${JAVA_PIDS[@]}"; do
+    log_msg "INFO" "Taking thread dump (jstack) for PID ${pid}"
+    jstack -l "${pid}" >"${OUTPUT_ROOT}/jstack_${pid}.txt" 2>&1 || true
+done
+
+###############################
+# Section 3 – Root Cause Analysis Helpers
+###############################
+
+SRC_ROOT="/opt/app/src"
+if [[ -d "${SRC_ROOT}" ]]; then
+    log_msg "INFO" "Searching source tree (${SRC_ROOT}) for the exact event string"
+    grep -R --line-number --binary-files=without-match "Event New event" "${SRC_ROOT}" \
+        >"${OUTPUT_ROOT}/source_grep_Event_New_event.txt" || true
+else
+    log_msg "WARN" "Source directory ${SRC_ROOT} does not exist – skipping grep step"
+fi
+
+log_msg "INFO" "Scanning Git history for commits mentioning \"event\""
+if command -v git >/dev/null && [[ -d "${SRC_ROOT}/.git" ]]; then
+    (
+        cd "${SRC_ROOT}"
+        git log -p --grep="event" >"${OUTPUT_ROOT}/git_log_event.txt"
+    )
+else
+    log_msg "WARN" "Git not available or ${SRC_ROOT} is not a repository – skipping git log step"
+fi
+
+# Heap snapshot for each PID
+for pid in "${JAVA_PIDS[@]}"; do
+    log_msg "INFO" "Running jmap -heap for PID ${pid}"
+    jmap -heap "${pid}" >"${OUTPUT_ROOT}/jmap_heap_${pid}.txt" 2>&1 || true
+done
+
+###############################
+# Section 4 – Optional Remediation Guidance
+###############################
+
+cat <<'EOF' >>"${OUTPUT_ROOT}/README_remediation.txt"
+
+=== REMEDIATION GUIDANCE ===
+
+If the event originates from application code:
+  * Locate the logging call that prints "New event Event New event ..."
+  * Verify its log level (DEBUG/TRACE) and adjust the configuration to disable it in prod.
+  * Rebuild/redeploy the corrected artifact.
+
+If a monitoring/agent component generates the message:
+  * Identify the agent (e.g., New Relic, Dynatrace) via the classpath or process args.
+  * Edit the agent's config to suppress the specific event type.
+  * Restart the service after changes.
+
+If the JVM itself emits the event (diagnostic flag):
+  * Determine which -XX option triggers the output (common candidates: -XX:+PrintGCDetails, -XX:+UnlockDiagnosticVMOptions).
+  * Remove or negate the flag (e.g., replace with -XX:-PrintGCDetails) in the startup script or systemd unit.
+  * Reload daemon and restart the service:
+        sudo systemctl daemon-reload
+        sudo systemctl restart <service_name>
+
+After applying any fix, monitor the logs for at least 24 hours to confirm disappearance.
+
+EOF
+
+###############################
+# Section 5 – Validation Aids
+###############################
+
+log_msg "INFO" "Preparing live‑monitor commands for post‑remediation verification"
+{
+    echo "# Tail the application log (adjust path if different)"
+    echo "tail -F /var/log/myapp/application.log"
+    echo ""
+    echo "# Quick CPU/IO snapshot (sar 1 10)"
+    echo "sar -u 1 10"
+} >"${OUTPUT_ROOT}/validation_commands.sh"
+chmod +x "${OUTPUT_ROOT}/validation_commands.sh"
+
+###############################
+# Completion Summary
+###############################
+
+log_msg "INFO" "Data collection complete. All artefacts stored in ${OUTPUT_ROOT}"
+log_msg "INFO" "Next steps:"
+echo "- Review ${OUTPUT_ROOT}/README_remediation.txt for possible fixes."
+echo "- Run ${OUTPUT_ROOT}/validation_commands.sh after any change to verify stability."
+
+exit 0
