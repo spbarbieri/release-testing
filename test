@@ -1,0 +1,127 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: diagnose_k8s_node.sh
+# Purpose: Diagnose common issues on a Kubernetes worker node.
+# Steps:
+#   1. Scan recent kubelet logs for errors or warnings.
+#   2. Verify node status via `kubectl get nodes`.
+#   3. Confirm the node has a valid non‑loopback IP address.
+#   4. Restart kubelet if the node is reachable but in a bad condition.
+# ------------------------------------------------------------
+
+# Configurable parameters
+LOG_LOOKBACK="1h"               # How far back to search logs (compatible with journalctl)
+KUBELET_UNIT="kubelet"
+MAX_LOG_LINES=1000              # Limit displayed log lines when errors are found
+NODE_NAME="$(hostname)"         # Assumes the node's hostname matches its name in K8s
+
+# Helper: print timestamped messages
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $*"
+}
+
+# Step 1 – Examine recent kubelet logs for errors or warnings
+check_logs() {
+    log "Scanning ${KUBELET_UNIT} logs for errors/warnings (last ${LOG_LOOKBACK})..."
+    # Capture matching lines; ignore case; treat both "error" and "warning"
+    mapfile -t LOG_MATCHES < <(
+        journalctl -u "${KUBELET_UNIT}" --since="${LOG_LOOKBACK}" \
+            | grep -Ei "(error|warning)" || true
+    )
+    if (( ${#LOG_MATCHES[@]} > 0 )); then
+        log "Found ${#LOG_MATCHES[@]} error/warning entries:"
+        printf '%s\n' "${LOG_MATCHES[@]:0:${MAX_LOG_LINES}}"
+        if (( ${#LOG_MATCHES[@]} > MAX_LOG_LINES )); then
+            log "... (${#LOG_MATCHES[@]} total, truncated to ${MAX_LOG_LINES} lines)"
+        fi
+        exit 1
+    else
+        log "No error or warning messages detected in recent logs."
+    fi
+}
+
+# Step 2 – Verify node status via kubectl
+check_node_status() {
+    log "Retrieving node status from the control plane..."
+    # Ensure kubectl is available
+    if ! command -v kubectl >/dev/null 2>&1; then
+        log "ERROR: kubectl not found in PATH."
+        exit 2
+    fi
+
+    # Get node info in JSON for reliable parsing
+    NODE_JSON=$(kubectl get node "${NODE_NAME}" -o json 2>/dev/null || true)
+
+    if [[ -z "${NODE_JSON}" ]]; then
+        log "Node '${NODE_NAME}' not listed in the cluster."
+        return 1   # Node unreachable
+    fi
+
+    # Extract the Ready condition status
+    NODE_CONDITION=$(echo "${NODE_JSON}" |
+        jq -r '.status.conditions[] | select(.type=="Ready") | .status')
+    
+    log "Node '${NODE_NAME}' Ready condition: ${NODE_CONDITION}"
+    if [[ "${NODE_CONDITION}" == "True" ]]; then
+        log "Node is healthy. No further action required."
+        exit 0
+    else
+        log "Node is NOT ready (condition=${NODE_CONDITION}). Proceeding with deeper checks."
+        return 0
+    fi
+}
+
+# Step 3 – Verify network configuration (IP address presence)
+check_network() {
+    log "Checking network interfaces for a non‑loopback IP address..."
+    # List IPv4 addresses excluding loopback (127.0.0.0/8)
+    mapfile -t ADDRS < <(ip -4 addr show scope global | awk '/inet/ {print $2}')
+    if (( ${#ADDRS[@]} == 0 )); then
+        log "WARNING: No global IPv4 address found on this node."
+        return 1
+    else
+        log "Detected IP address(es): ${ADDRS[*]}"
+        return 0
+    fi
+}
+
+# Step 4 – Restart kubelet service if node is reachable but unhealthy
+restart_kubelet() {
+    log "Attempting to restart the kubelet service..."
+    if systemctl is-active --quiet "${KUBELET_UNIT}"; then
+        sudo systemctl restart "${KUBELET_UNIT}"
+        log "kubelet restarted successfully."
+    else
+        log "kubelet service is not active; starting it instead."
+        sudo systemctl start "${KUBELET_UNIT}"
+    fi
+
+    # Give kubelet a moment to re-register
+    sleep 10
+
+    # Re‑evaluate node status after restart
+    log "Re‑checking node status post‑restart..."
+    if kubectl get node "${NODE_NAME}" -o json | jq -r '.status.conditions[] | select(.type=="Ready") | .status' | grep -q "^True$"; then
+        log "Node is now Ready. Issue resolved."
+        exit 0
+    else
+        log "Node remains not Ready after kubelet restart."
+        exit 3
+    fi
+}
+
+# -------------------- Main Execution Flow --------------------
+check_logs
+
+if ! check_node_status; then
+    # Node not listed => likely networking issue
+    if ! check_network; then
+        log "Please investigate network configuration / physical connectivity."
+        exit 4
+    fi
+fi
+
+# At this point the node is listed but not Ready → try restarting kubelet
+restart_kubelet
