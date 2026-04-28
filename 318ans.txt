@@ -1,0 +1,80 @@
+- name: Detect and remediate high CPU consumption
+  hosts: monitored_hosts
+  gather_facts: false
+  become: true
+  vars:
+    cpu_top_n: 15                         # Number of top processes to examine
+    cpu_threshold_percent: 80            # CPU usage (%) above which a process is flagged
+    protected_processes:                 # Processes that should never be terminated
+      - sshd
+      - systemd
+      - ansible-playbook
+  tasks:
+    - name: Capture snapshot of CPU usage
+      ansible.builtin.command: ps -eo pid,comm,%cpu --sort=-%cpu | head -n {{ cpu_top_n + 1 }}
+      register: cpu_snapshot
+      changed_when: false
+      failed_when: cpu_snapshot.rc != 0
+
+    - name: Parse CPU snapshot into structured data
+      ansible.builtin.set_fact:
+        cpu_process_list: >-
+          {{
+            cpu_snapshot.stdout_lines[1:]                                   # Skip header line
+            | map('split')                                                  # Split each line into fields
+            | map('list')
+            | map('zip', ['pid','command','cpu'])
+            | map('items2dict')
+            | list
+          }}
+
+    - name: Identify processes exceeding CPU threshold
+      ansible.builtin.set_fact:
+        high_cpu_processes: >-
+          {{
+            cpu_process_list
+            | selectattr('cpu','float')
+            | selectattr('cpu','>', cpu_threshold_percent)
+            | rejectattr('command','in', protected_processes)
+            | list
+          }}
+
+    - name: Show flagged high‑CPU processes
+      ansible.builtin.debug:
+        msg: "PID {{ item.pid }} ({{ item.command }}) consumes {{ item.cpu }}% CPU"
+      loop: "{{ high_cpu_processes }}"
+      when: high_cpu_processes | length > 0
+
+    - name: Attempt to terminate offending processes
+      block:
+        - name: Kill high‑CPU process
+          ansible.builtin.shell: kill -9 {{ item.pid }}
+          args:
+            warn: false
+          loop: "{{ high_cpu_processes }}"
+          loop_control:
+            label: "{{ item.command }} (PID {{ item.pid }})"
+          register: kill_results
+          ignore_errors: true   # Continue even if individual kills fail
+
+        - name: Summarize termination outcomes
+          ansible.builtin.debug:
+            msg: >-
+              {% for res in kill_results.results %}
+                PID {{ res.item.pid }}: {{ 'SUCCESS' if res.rc == 0 else 'FAILED (' ~ (res.stderr|default('no output')) ~ ')' }};
+              {% endfor %}
+      rescue:
+        - name: Log failure during termination step
+          ansible.builtin.debug:
+            msg: "An error occurred while trying to kill high‑CPU processes."
+
+      always:
+        - name: Recommendation for scaling actions
+          ansible.builtin.debug:
+            msg: >-
+              {% if high_cpu_processes | length > 0 %}
+                Consider migrating workload(s) {{ high_cpu_processes | map(attribute='command') | join(', ') }}
+                to another host or provisioning additional CPU resources for this node.
+              {% else %}
+                No high‑CPU processes detected beyond the defined threshold.
+              {% endif %}
