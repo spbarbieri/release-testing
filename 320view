@@ -1,0 +1,103 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+LOG_JOURNAL_UNIT="kubelet"          # systemd unit to inspect
+LOG_SINCE="1h"                      # time window for log search (e.g., "30m", "2h")
+NODE_NAME="$(hostname)"             # assumes node's hostname matches its name in k8s
+KUBECTL_CMD="${KUBECTL_CMD:-kubectl}"   # allow override via env var
+IP_INTERFACE=""                    # optional: specify interface (empty = any)
+
+# ------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [${1^^}] $2"
+}
+
+exit_with_message() {
+    log "$1" "$2"
+    exit "${3:-0}"
+}
+
+# ------------------------------------------------------------
+# Step 1 – Scan kubelet logs for errors or warnings
+# ------------------------------------------------------------
+log "info" "Scanning ${LOG_JOURNAL_UNIT} logs for errors/warnings (last ${LOG_SINCE})..."
+if journalctl -u "${LOG_JOURNAL_UNIT}" --since "${LOG_SINCE}" | grep -iE "(error|warning)"; then
+    exit_with_message "error" "Found error/warning entries in ${LOG_JOURNAL_UNIT} logs." 1
+else
+    log "info" "No error or warning messages found in recent logs."
+fi
+
+# ------------------------------------------------------------
+# Step 2 – Verify node appears in `kubectl get nodes`
+# ------------------------------------------------------------
+log "info" "Checking node status via '${KUBECTL_CMD} get nodes'..."
+if ! NODE_TABLE="$(${KUBECTL_CMD} get nodes -o wide 2>/dev/null)"; then
+    log "error" "'${KUBECTL_CMD}' failed – is the CLI installed/configured?"
+    exit 2
+fi
+
+# Extract the line corresponding to this node
+NODE_LINE=$(echo "${NODE_TABLE}" | awk -v n="${NODE_NAME}" '$1==n')
+if [[ -z "${NODE_LINE}" ]]; then
+    log "warning" "Node '${NODE_NAME}' not listed in 'kubectl get nodes'."
+    
+    # ------------------------------------------------------------
+    # Step 3 – Verify network configuration (IP address)
+    # ------------------------------------------------------------
+    log "info" "Inspecting network interfaces for an assigned IP address..."
+    if [[ -n "${IP_INTERFACE}" ]]; then
+        IP_OUTPUT=$(ip -brief addr show dev "${IP_INTERFACE}" || true)
+    else
+        IP_OUTPUT=$(ip -brief addr show || true)
+    fi
+    
+    if echo "${IP_OUTPUT}" | grep -qE '\binet\b'; then
+        log "info" "An IP address is present on the node."
+        exit_with_message "error" "Node still not reachable by the control plane." 3
+    else
+        log "error" "No IP address detected on the node. Network mis‑configuration."
+        exit 4
+    fi
+fi
+
+# Parse the STATUS column (second field)
+STATUS=$(echo "${NODE_LINE}" | awk '{print $2}')
+log "info" "Node '${NODE_NAME}' reported status: ${STATUS}"
+
+# ------------------------------------------------------------
+# Step 4 – Handle non‑ready/bad conditions
+# ------------------------------------------------------------
+if [[ "${STATUS}" == "Ready" ]]; then
+    log "info" "Node is healthy. No further action required."
+    exit 0
+else
+    log "warning" "Node status is '${STATUS}'. Attempting remediation..."
+
+    # ------------------------------------------------------------
+    # Step 5 – Restart kubelet service
+    # ------------------------------------------------------------
+    log "info" "Restarting kubelet service..."
+    if systemctl restart kubelet; then
+        log "info" "kubelet restarted successfully. Waiting briefly for status update..."
+        sleep 15
+        
+        # Re‑query node status
+        NEW_STATUS=$(${KUBECTL_CMD} get node "${NODE_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+        if [[ "${NEW_STATUS}" == "True" ]]; then
+            log "info" "Node recovered to Ready state after kubelet restart."
+            exit 0
+        else
+            log "error" "Node remains in non‑Ready state after kubelet restart."
+            exit 5
+        fi
+    else
+        log "error" "Failed to restart kubelet."
+        exit 6
+    fi
+fi
