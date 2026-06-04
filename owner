@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+#
+# Automated triage & diagnostic script for “Test per‑process ‘processor down’” alerts
+#
+# Usage:
+#   ./process_triage.sh -s <service-name> -p <pid> [-c <container-id>] \
+#       [-d <deployment-name>] [-n <namespace>] [-a <alertdef.json>] \
+#       [-P <health-port>] [-l </path/to/log/dir>]
+#
+# Required environment/tools:
+#   - ps, git, systemctl, sar, iostat, df, journalctl, tail, grep, dmesg,
+#     curl, nc, jq, kubectl (optional), docker (optional)
+#
+# All collected data is stored under a timestamped directory in /tmp.
+#
+
+set -euo pipefail
+
+#############################
+# Default configurable vars #
+#############################
+SERVICE_NAME=""
+PID=""
+CONTAINER_ID=""
+DEPLOYMENT_NAME=""
+NAMESPACE="default"
+ALERTDEF_PATH=""
+HEALTH_PORT=""
+LOG_ROOT="/var/log"
+
+######################################
+# Helper functions and sanity checks #
+######################################
+usage() {
+    cat <<EOF
+Usage: $0 -s <service-name> -p <pid> [options]
+
+Required:
+  -s <service-name>          Name of the systemd service / application
+  -p <pid>                   PID of the affected process
+
+Optional:
+  -c <container-id>         Docker/K8s container ID (for cgroup inspection)
+  -d <deployment-name>      K8s deployment name (used for restarts & quota checks)
+  -n <namespace>            K8s namespace (default: ${NAMESPACE})
+  -a <alertdef.json>        Path to the alert definition JSON/YAML file
+  -P <health-port>          Port exposing HTTP health endpoint
+  -l <log-root>             Root directory where service logs reside (default: ${LOG_ROOT})
+  -h                         Show this help message
+EOF
+    exit 1
+}
+
+log_msg() {
+    local level="\$1"; shift
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [\$level] \$*"
+}
+
+run_cmd() {
+    local cmd="\$*"
+    log_msg "INFO" "Running: \$cmd"
+    eval "\$cmd"
+}
+
+check_tool() {
+    command -v "\$1" >/dev/null 2>&1 || {
+        log_msg "WARN" "Tool '\$1' not found; skipping related step."
+        return 1
+    }
+    return 0
+}
+
+#########################
+# Parse command line    #
+#########################
+while getopts ":s:p:c:d:n:a:P:l:h" opt; do
+    case "\$opt" in
+        s) SERVICE_NAME="\$OPTARG" ;;
+        p) PID="\$OPTARG" ;;
+        c) CONTAINER_ID="\$OPTARG" ;;
+        d) DEPLOYMENT_NAME="\$OPTARG" ;;
+        n) NAMESPACE="\$OPTARG" ;;
+        a) ALERTDEF_PATH="\$OPTARG" ;;
+        P) HEALTH_PORT="\$OPTARG" ;;
+        l) LOG_ROOT="\$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+[[ -z "\$SERVICE_NAME" ]] && { log_msg "ERROR" "Service name required (-s)"; usage; }
+[[ -z "\$PID" ]] && { log_msg "ERROR" "PID required (-p)"; usage; }
+
+TIMESTAMP="\$(date +%Y%m%d%H%M%S)"
+WORKDIR="/tmp/process_triage_\${TIMESTAMP}"
+mkdir -p "\$WORKDIR"
+log_msg "INFO" "Working directory created at \$WORKDIR"
+
+####################################
+# 1. Immediate Triage (first 15m)  #
+####################################
+
+# 1.a Verify alert is not a test alert
+if [[ -n "\$ALERTDEF_PATH" ]]; then
+    if check_tool yq; then
+        TEST_FLAG=\$(yq e '.severity // ""' "\$ALERTDEF_PATH" 2>/dev/null || true)
+        if [[ "\$TEST_FLAG" == "test"* ]]; then
+            log_msg "WARN" "Alert definition indicates a test alert (severity: \$TEST_FLAG). Exiting."
+            exit 0
+        fi
+    elif check_tool grep; then
+        if grep -iqE 'severity:\s*test' "\$ALERTDEF_PATH"; then
+            log_msg "WARN" "Alert definition contains 'severity: test'. Exiting."
+            exit 0
+        fi
+    fi
+fi
+
+# 1.b Verify process status
+{
+    log_msg "INFO" "Checking process \${PID} status"
+    ps -p "\$PID" -o pid,ppid,user,%cpu,%mem,cmd >"\$WORKDIR/process_ps.txt"
+} || {
+    log_msg "ERROR" "Process \${PID} not found"
+}
+
+# 1.c Recent deployments / config changes
+{
+    REPO_PATH="/path/to/service/repo"   # <-- adjust as needed
+    if [[ -d "\$REPO_PATH/.git" ]]; then
+        log_msg "INFO" "Fetching last 5 commits from repo"
+        git -C "\$REPO_PATH" log -n 5 --oneline >"\$WORKDIR/git_recent.log"
+    else
+        log_msg "WARN" "Repo path '\$REPO_PATH' not a git repository; skipping."
+    fi
+} 
+
+# 1.d Monitoring agents health
+{
+    log_msg "INFO" "Checking prometheus-node-exporter status"
+    systemctl status prometheus-node-exporter >"\$WORKDIR/prometheus_node_exporter.status" 2>&1 || true
+    log_msg "INFO" "Checking datadog-agent status"
+    systemctl status datadog-agent >"\$WORKDIR/datadog_agent.status" 2>&1 || true
+}
+
+#########################################
+# 2. Detailed Diagnostic Data Collection #
+#########################################
+
+# Helper to append command output with timestamps
+capture() {
+    local description="\$1"
+    local outfile="\$2"
+    shift 2
+    {
+        echo "===== \$(date '+%Y-%m-%d %H:%M:%S') : \$description ====="
+        "\$@"
+        echo -e "\n\n"
+    } >>"\$outfile"
+}
+
+DIAG_LOG="\$WORKDIR/diagnostic_report.txt"
+
+# 2.1 System‑level metrics
+if check_tool sar; then
+    capture "sar CPU utilization (last 10 sec)" "\$DIAG_LOG" sar -u 1 10
+fi
+if check_tool sar; then
+    capture "sar Memory utilization (last 10 sec)" "\$DIAG_LOG" sar -r 1 10
+fi
+if check_tool iostat; then
+    capture "iostat device stats (last 10 sec)" "\$DIAG_LOG" iostat -xz 1 10
+fi
+
+# Disk usage for service data dirs (customize path)
+SERVICE_DATA_DIR="/var/lib/\${SERVICE_NAME}"
+if [[ -d "\$SERVICE_DATA_DIR" ]]; then
+    capture "Disk space usage for \$SERVICE_DATA_DIR" "\$DIAG_LOG" df -h "\$SERVICE_DATA_DIR"
+    capture "Inode usage for \$SERVICE_DATA_DIR" "\$DIAG_LOG" df -i "\$SERVICE_DATA_DIR"
+else
+    log_msg "WARN" "Service data directory '\$SERVICE_DATA_DIR' does not exist."
+fi
+
+# 2.2 Application logs
+JOURNAL_SINCE="5 minutes ago"
+capture "journalctl for \${SERVICE_NAME} since \$JOURNAL_SINCE" "\$DIAG_LOG" journalctl -u "\${SERVICE_NAME}" --since "\$JOURNAL_SINCE"
+APP_LOG_FILE="\${LOG_ROOT}/\${SERVICE_NAME}/\${SERVICE_NAME}.log"
+if [[ -f "\$APP_LOG_FILE" ]]; then
+    capture "Tail last 200 lines of app log" "\$DIAG_LOG" tail -n 200 "\$APP_LOG_FILE"
+    capture "Error patterns in app log (last 200 lines)" "\$DIAG_LOG" grep -iE "error|exception|kill|shutdown" "\$APP_LOG_FILE" || true
+else
+    log_msg "WARN" "Application log file '\$APP_LOG_FILE' not found."
+fi
+
+# 2.3 Kernel messages
+if check_tool dmesg; then
+    capture "Kernel OOM / segfault messages" "\$DIAG_LOG" dmesg | grep -i -E "oom|killed process|segfault" || true
+fi
+
+# 2.4 Health endpoint
+if [[ -n "\$HEALTH_PORT" ]]; then
+    if check_tool curl; then
+        capture "Health endpoint HTTP status" "\$DIAG_LOG" curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:\${HEALTH_PORT}/healthz"
+    fi
+fi
+
+# 2.5 Internal diagnostics script
+DIAG_SCRIPT="/opt/\${SERVICE_NAME}/bin/diagnose.sh"
+if [[ -x "\$DIAG_SCRIPT" ]]; then
+    capture "Internal diagnostics script output" "\$DIAG_LOG" "\$DIAG_SCRIPT" --verbose
+else
+    log_msg "WARN" "Diagnostics script '\$DIAG_SCRIPT' not executable or missing."
+fi
+
+# 2.6 Dependency services connectivity
+declare -A DEPS=( ["db-host"]="5432" ["mq-host"]="5672" )
+if check_tool nc; then
+    for host port in "\${!DEPS[@]}"; do
+        capture "Connectivity test to \$host:\$port" "\$DIAG_LOG" nc -zvw3 "\$host" "\$port" || true
+    done
+fi
+
+# 2.7 Resource limits (cgroups / k8s)
+if [[ -n "\$CONTAINER_ID" ]]; then
+    CGROUP_MEM="/sys/fs/cgroup/memory/docker/\${CONTAINER_ID}/memory.limit_in_bytes"
+    if [[ -f "\$CGROUP_MEM" ]]; then
+        capture "Container memory limit (cgroup)" "\$DIAG_LOG" cat "\$CGROUP_MEM"
+    else
+        log_msg "WARN" "Cgroup memory limit file not found for container \${CONTAINER_ID}"
+    fi
+fi
+
+if [[ -n "\$DEPLOYMENT_NAME" ]] && check_tool kubectl; then
+    capture "Kubernetes pod description for deployment \${DEPLOYMENT_NAME}" "\$DIAG_LOG" kubectl describe pod -l app=\${DEPLOYMENT_NAME} -n "\${NAMESPACE}"
+fi
+
+# 2.8 Correlate with other alerts (Alertmanager API)
+if [[ -n "\$ALERTDEF_PATH" ]] && check_tool curl && check_tool jq; then
+    ALERTMANAGER_URL="http://localhost:9093/api/v2/alerts"
+    capture "Recent alerts from Alertmanager" "\$DIAG_LOG" curl -sG "\$ALERTMANAGER_URL" --data-urlencode "receiver=all" | jq . || true
+fi
+
+#########################################
+# 3. Summarise & Output                 #
+#########################################
+SUMMARY="\$WORKDIR/summary.txt"
+{
+    echo "=== Process Triage Summary ==="
+    echo "Timestamp: \$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Service: \${SERVICE_NAME}"
+    echo "PID: \${PID}"
+    echo "Workdir: \${WORKDIR}"
+    echo ""
+    echo "--- Process Status ---"
+    cat "\$WORKDIR/process_ps.txt" 2>/dev/null || echo "Not captured"
+    echo ""
+    echo "--- Recent Git Commits ---"
+    cat "\$WORKDIR/git_recent.log" 2>/dev/null || echo "Not captured"
+    echo ""
+    echo "--- Agent Statuses ---"
+    echo "prometheus-node-exporter:"
+    cat "\$WORKDIR/prometheus_node_exporter.status" 2>/dev/null || echo "Not captured"
+    echo "datadog-agent:"
+    cat "\$WORKDIR/datadog_agent.status" 2>/dev/null || echo "Not captured"
+    echo ""
+    echo "--- Diagnostic Report (excerpt) ---"
+    head -n 40 "\$DIAG_LOG"
+} > "\$SUMMARY"
+
+log_msg "INFO" "Triage complete. Full diagnostic report saved to: \$DIAG_LOG"
+log_msg "INFO" "Summary written to: \$SUMMARY"
+log_msg "INFO" "Archive all files in: \$WORKDIR"
+
+exit 0
