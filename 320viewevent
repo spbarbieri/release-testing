@@ -1,0 +1,228 @@
+#!/bin/bash
+#
+# High Load Detection & Diagnostic Script
+# ---------------------------------------
+# Triggers when 1‑minute load average exceeds 2 × CPU core count.
+# Captures extensive diagnostics and provides basic remediation hints.
+#
+# Usage:
+#   ./high_load_check.sh            # Run detection & diagnostics
+#   ./high_load_check.sh --auto     # Attempt limited automatic remediation
+#
+# Author: Automated Assistant
+# License: MIT
+
+set -euo pipefail
+
+##############################
+# Configuration & Constants #
+##############################
+THRESHOLD_MULTIPLIER=2          # Load threshold = cores * multiplier
+REPORT_DIR="/var/tmp/high_load_reports"
+TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+REPORT_FILE="${REPORT_DIR}/report_${TIMESTAMP}.log"
+AUTO_REMEDIATE=false
+
+#######################################
+# Helper Functions                     #
+#######################################
+
+log() {
+    local msg="$1"
+    echo "[${TIMESTAMP}] $msg" | tee -a "$REPORT_FILE"
+}
+
+run_cmd() {
+    local description="$1"
+    shift
+    local cmd=("$@")
+    log "=== $description ==="
+    if "${cmd[@]}" >>"$REPORT_FILE" 2>&1; then
+        log "--- End of $description ---"
+    else
+        log "*** Command failed: ${cmd[*]} ***"
+    fi
+    echo "" >>"$REPORT_FILE"
+}
+
+detect_auto_flag() {
+    if [[ "${1:-}" == "--auto" ]]; then
+        AUTO_REMEDIATE=true
+    fi
+}
+
+get_core_count() {
+    nproc
+}
+
+get_one_min_load() {
+    # Extract first field from /proc/loadavg (1‑min average)
+    awk '{print $1}' /proc/loadavg
+}
+
+compare_load() {
+    local load=$1
+    local cores=$2
+    local threshold=$(( cores * THRESHOLD_MULTIPLIER ))
+    if (( $(awk "BEGIN {print ($load > $threshold)}") )); then
+        return 0    # high load
+    else
+        return 1    # normal
+    fi
+}
+
+collect_basic_info() {
+    run_cmd "CPU Core Count" nproc
+    run_cmd "Uptime & Load Averages" uptime
+    run_cmd "Contents of /proc/loadavg" cat /proc/loadavg
+    run_cmd "Current 1‑min Load vs Threshold" \
+        bash -c "load=\$(awk '\''{print \$1}'\'' /proc/loadavg); cores=\$(nproc); thresh=\$((cores*$THRESHOLD_MULTIPLIER)); echo \"Load=\$load  Cores=\$cores  Threshold=\$thresh\""
+}
+
+collect_process_info() {
+    run_cmd "Top 20 CPU consuming processes (ps)" \
+        ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%cpu | head -20
+    run_cmd "Top 15 CPU consumers (top -b -n1)" \
+        top -b -n1 -o %CPU | head -15
+}
+
+collect_io_info() {
+    if command -v iostat >/dev/null 2>&1; then
+        run_cmd "IOStat (3 samples, 1 sec interval)" iostat -xz 1 3
+    else
+        log "iostat not installed; skipping IOStat collection."
+    fi
+    run_cmd "Disk stats for sda" grep sda /proc/diskstats || true
+}
+
+collect_memory_info() {
+    run_cmd "Memory usage (free -m)" free -m
+    run_cmd "Swap devices (swapon -s)" swapon -s
+    run_cmd "Recent OOM messages in dmesg" dmesg | grep -i oom || true
+}
+
+collect_kernel_stats() {
+    run_cmd "vmstat (1 sec interval, 5 samples)" vmstat 1 5
+    run_cmd "Recent error level journal entries" journalctl -p err -b | tail -20
+}
+
+collect_cron_info() {
+    run_cmd "User crontab (-l)" crontab -l || true
+    run_cmd "System cron directories listing" ls -lR /etc/cron* 2>/dev/null || true
+}
+
+collect_package_history() {
+    if command -v rpm >/dev/null 2>&1; then
+        run_cmd "Latest RPM package installs/updates" rpm -qa --last | head -10
+    elif command -v dpkg-query >/dev/null 2>&1; then
+        run_cmd "Latest DEB package installs/updates" dpkg-query -Wf '${Package} ${Version}\n' | sort -k2,2r | head -10
+    else
+        log "Neither rpm nor dpkg-query found; skipping package history."
+    fi
+}
+
+perform_diagnostics() {
+    mkdir -p "$REPORT_DIR"
+    : >"$REPORT_FILE"   # truncate/create
+
+    log "High load detected! Generating diagnostic report at $REPORT_FILE"
+
+    collect_basic_info
+    collect_process_info
+    collect_io_info
+    collect_memory_info
+    collect_kernel_stats
+    collect_cron_info
+    collect_package_history
+
+    log "Diagnostic collection complete."
+}
+
+suggest_remediation() {
+    log "=== Remediation Suggestions ==="
+    # Identify top CPU consumer PID
+    TOP_PID=$(ps -eo pid,%cpu,comm --sort=-%cpu | awk 'NR==2 {print $1}')
+    if [[ -n "$TOP_PID" && "$TOP_PID" != "PID" ]]; then
+        log "Top CPU consumer PID: $TOP_PID"
+        log "Consider lowering its priority:"
+        log "    renice +10 $TOP_PID"
+        log "If unresponsive, you may terminate it:"
+        log "    kill -TERM $TOP_PID   # graceful"
+        log "    kill -KILL $TOP_PID   # forceful"
+    else
+        log "Unable to determine top CPU consumer."
+    fi
+
+    log "Check I/O scheduler (example for sda):"
+    log "    cat /sys/block/sda/queue/scheduler"
+    log "To change to 'deadline':"
+    log "    echo deadline > /sys/block/sda/queue/scheduler"
+
+    log "If swap usage is high, tune swappiness:"
+    log "    sysctl -w vm.swappiness=10"
+
+    log "Restart potentially leaky services (adjust as needed):"
+    log "    systemctl restart httpd"
+    log "    systemctl restart mysqld"
+
+    log "For persistent limits, consider cgroups/systemd scopes."
+    log "=== End of Suggestions ==="
+}
+
+automatic_remediation() {
+    log "=== Automatic Remediation Started ==="
+
+    # 1. Renice top CPU consumer (if we have permission)
+    if [[ "$(id -u)" -eq 0 ]]; then
+        TOP_PID=$(ps -eo pid,%cpu,comm --sort=-%cpu | awk 'NR==2 {print $1}')
+        if [[ -n "$TOP_PID" && "$TOP_PID" != "PID" ]]; then
+            log "Renicing PID $TOP_PID by +10"
+            renice +10 "$TOP_PID" >>"$REPORT_FILE" 2>&1 || log "Failed to renice PID $TOP_PID"
+        fi
+    else
+        log "Script not running as root; skipping renice."
+    fi
+
+    # 2. Set I/O scheduler to deadline for sda (requires root)
+    if [[ -w /sys/block/sda/queue/scheduler ]]; then
+        log "Setting I/O scheduler for sda to deadline"
+        echo deadline > /sys/block/sda/queue/scheduler
+    else
+        log "Cannot modify I/O scheduler (permission denied or missing device)."
+    fi
+
+    # 3. Lower swappiness
+    if [[ "$(sysctl -n vm.swappiness)" != "10" ]]; then
+        log "Adjusting vm.swappiness to 10"
+        sysctl -w vm.swappiness=10 >>"$REPORT_FILE" 2>&1 || log "Failed to set swappiness"
+    fi
+
+    log "=== Automatic Remediation Completed ==="
+}
+
+main() {
+    detect_auto_flag "${1:-}"
+
+    CORES=$(get_core_count)
+    LOAD1=$(get_one_min_load)
+
+    log "Detected CPU cores: $CORES"
+    log "Current 1‑min load average: $LOAD1"
+
+    if compare_load "$LOAD1" "$CORES"; then
+        log "Load (${LOAD1}) exceeds threshold (${CORES} * $THRESHOLD_MULTIPLIER = $((CORES*THRESHOLD_MULTIPLIER)))"
+        perform_diagnostics
+
+        if $AUTO_REMEDIATE; then
+            automatic_remediation
+        else
+            suggest_remediation
+        fi
+
+        log "Review the full report at: $REPORT_FILE"
+    else
+        log "Load is within acceptable range. No action required."
+    fi
+}
+
+main "$@"
