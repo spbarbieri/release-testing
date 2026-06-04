@@ -1,0 +1,186 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Diagnostic & Remediation Script – “Test per-process ‘processor down’”
+# ------------------------------------------------------------
+
+# ---------- Configuration ----------
+# These values can be overridden via environment variables or command‑line args.
+PROCESS_NAME="${PROCESS_NAME:-processor}"               # Name of the binary/executable
+SERVICE_NAME="${SERVICE_NAME:-processor.service}"      # systemd unit managing the process
+APP_LOG_DIR="${APP_LOG_DIR:-/var/log/processor}"        # Directory containing logs
+APP_LOG_FILE="${APP_LOG_FILE:-${APP_LOG_DIR}/processor.log}"
+DB_HOST="${DB_HOST:-db.example.com}"
+DB_PORT="${DB_PORT:-5432}"
+API_ENDPOINT="${API_ENDPOINT:-http://api.example.com/health}"
+DEPENDENCY_PORT="${DEPENDENCY_PORT:-8080}"
+PAGERDUTY_INTEGRATION_KEY="${PAGERDUTY_INTEGRATION_KEY:-YOUR_INTEGRATION_KEY}"
+
+# ---------- Helper Functions ----------
+log() {
+    local level="$1"
+    shift
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+}
+
+acknowledge_alert() {
+    # Expect JSON payload on STDIN or passed as first argument
+    local payload="${1:-}"
+    if [[ -z "$payload" ]]; then
+        log "WARN" "No alert payload provided; skipping PagerDuty acknowledgement."
+        return
+    fi
+    # Minimal PagerDuty Events V2 acknowledgement (placeholder)
+    curl -sS -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"routing_key\":\"$PAGERDUTY_INTEGRATION_KEY\",\"event_action\":\"acknowledge\",\"payload\":$payload}" \
+        https://events.pagerduty.com/v2/enqueue >/dev/null 2>&1 && \
+        log "INFO" "Alert acknowledged in PagerDuty."
+}
+
+extract_timestamp_and_host() {
+    local json_payload="$1"
+    ALERT_TIME=$(echo "$json_payload" | jq -r '.incident.created_at // empty')
+    ALERT_HOST=$(echo "$json_payload" | jq -r '.incident.assignments[0].assignee.summary // empty')
+    : "${ALERT_TIME:?Failed to extract alert timestamp}"
+    : "${ALERT_HOST:?Failed to extract alert host}"
+    log "INFO" "Alert Time: $ALERT_TIME, Host: $ALERT_HOST"
+}
+
+list_processes() {
+    log "INFO" "Listing processes matching '$PROCESS_NAME'"
+    ps -ef | grep -v grep | grep -F "$PROCESS_NAME" || true
+    pgrep -fl "$PROCESS_NAME" || true
+}
+
+check_system_resources() {
+    log "INFO" "Capturing short-term system snapshot"
+    top -b -n 1 | head -20
+    if command -v iostat >/dev/null 2>&1; then
+        iostat -x 5 3
+    else
+        log "WARN" "'iostat' not installed; skipping disk I/O check."
+    fi
+    free -m
+}
+
+review_application_logs() {
+    log "INFO" "Fetching last 200 lines of ${APP_LOG_FILE}"
+    tail -n 200 "$APP_LOG_FILE" || true
+    log "INFO" "Searching for error patterns"
+    grep -iE "error|exception|fatal" "$APP_LOG_FILE" || true
+}
+
+check_dependencies() {
+    log "INFO" "Testing DB connectivity (${DB_HOST}:${DB_PORT})"
+    nc -zvw5 "$DB_HOST" "$DB_PORT" || log "ERROR" "Database unreachable"
+
+    log "INFO" "Testing API health endpoint ($API_ENDPOINT)"
+    if ! curl -fsS "$API_ENDPOINT" >/dev/null; then
+        log "ERROR" "API health check failed"
+    fi
+
+    log "INFO" "Verifying required port $DEPENDENCY_PORT is listening"
+    ss -tulnp | grep -w "$DEPENDENCY_PORT" || log "ERROR" "Port $DEPENDENCY_PORT not open"
+}
+
+restart_service_graceful() {
+    log "INFO" "Attempting graceful restart of $SERVICE_NAME"
+    if systemctl restart "$SERVICE_NAME"; then
+        log "INFO" "Graceful restart succeeded"
+    else
+        log "WARN" "Graceful restart failed; attempting forced restart"
+        systemctl stop "$SERVICE_NAME"
+        systemctl start "$SERVICE_NAME"
+    fi
+    systemctl status "$SERVICE_NAME" --no-pager
+}
+
+post_recovery_validation() {
+    log "INFO" "Re-running dependency health checks"
+    check_dependencies
+
+    log "INFO" "Tailing log for 5 minutes to verify normal operation"
+    tail -f "$APP_LOG_FILE" &
+    TAIL_PID=$!
+    sleep 300
+    kill "$TAIL_PID" 2>/dev/null || true
+}
+
+collect_rca_data() {
+    log "INFO" "Collecting RCA data"
+    # Correlate alert time with syslog/kern.log for OOM or other events
+    journalctl -u "$SERVICE_NAME" --since "$ALERT_TIME" | tail -n 50 > "/tmp/${SERVICE_NAME}_rca.log"
+    dmesg | grep -i -E "out of memory|oom" | tail -n 20 >> "/tmp/${SERVICE_NAME}_rca.log"
+    log "INFO" "RCA snippet saved to /tmp/${SERVICE_NAME}_rca.log"
+    # Placeholder for deployment/config change audit
+    log "INFO" "Recent package updates:"
+    rpm -qa --last | head -n 10 || dpkg-query -W -f='${Package} ${Version} ${Installed-Size}\n' | sort -k3 -nr | head -n 10
+}
+
+install_watchdog() {
+    local wd_path="/usr/local/bin/${PROCESS_NAME}_watchdog.sh"
+    cat <<'EOF' > "$wd_path"
+#!/bin/bash
+set -euo pipefail
+while true; do
+    if ! pgrep -f "${PROCESS_NAME}" >/dev/null; then
+        logger -t "${PROCESS_NAME}_watchdog" "Process not found, starting ${SERVICE_NAME}"
+        systemctl start "${SERVICE_NAME}"
+    fi
+    sleep 60
+done
+EOF
+    chmod +x "$wd_path"
+    log "INFO" "Watchdog script installed at $wd_path"
+    # Optionally create a systemd unit for the watchdog (omitted for brevity)
+}
+
+notify_stakeholders() {
+    local message="${1:-Resolution completed}"
+    # Simple email notification placeholder
+    if command -v mail >/dev/null 2>&1; then
+        echo "$message" | mail -s "[Incident Resolved] $SERVICE_NAME" ops@example.com
+        log "INFO" "Stakeholder notified via email."
+    else
+        log "WARN" "Mail command not available; stakeholder notification skipped."
+    fi
+}
+
+# ---------- Main Execution Flow ----------
+main() {
+    # Accept optional JSON payload as first argument or read from stdin
+    local payload
+    if [[ $# -gt 0 ]]; then
+        payload="$(cat "$1")"
+    else
+        payload="$(cat -)"   # expects piped JSON
+    fi
+
+    acknowledge_alert "$payload"
+    extract_timestamp_and_host "$payload"
+
+    list_processes
+
+    if ! pgrep -f "$PROCESS_NAME" >/dev/null; then
+        log "ERROR" "Target process '$PROCESS_NAME' not running – proceeding to recovery."
+        restart_service_graceful
+    else
+        log "INFO" "Process '$PROCESS_NAME' is already running."
+    fi
+
+    check_system_resources
+    review_application_logs
+    check_dependencies
+
+    post_recovery_validation
+    collect_rca_data
+    install_watchdog
+    notify_stakeholders "Processor issue resolved on $(hostname) at $(date)."
+
+    log "INFO" "Diagnostic & remediation workflow completed successfully."
+}
+
+# Execute main with all script arguments
+main "$@"
