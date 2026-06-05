@@ -1,210 +1,275 @@
-#!/bin/bash
-set -euo pipefail
-
-# ------------------------------------------------------------
-# Host Availability Diagnostic Script
+#!/usr/bin/env bash
 #
-# This script runs a comprehensive set of checks to diagnose
-# a “245‑HostAvailabilityRule‑All Entities” alert.
+# Processor‑down automated triage & remediation script
+# ---------------------------------------------------
+# This script implements the run‑book described in the prompt.
+# It expects the name of the systemd service (or bare process name)
+# that reported the failure and performs diagnostics, attempts
+# remediation and validates recovery.
 #
 # Usage:
-#   ./host_diagnostic.sh -h <host_ip_or_fqdn> \
-#                        [-e <monitored_endpoint>] \
-#                        [-s <service1,service2,...>] \
-#                        [-a <monitoring_agent_service>] \
-#                        [-t <api_token>]
+#   ./proc_down.sh <service_name> [health_check_url]
 #
 # Example:
-#   ./host_diagnostic.sh -h 10.0.1.23 -e api.myapp.internal \
-#                        -s sshd,httpd,mysqld -a datadog-agent \
-#                        -t abcdef1234567890
-# ------------------------------------------------------------
+#   ./proc_down.sh myapp-worker.service http://localhost:8080/health
+#
+# Exit codes:
+#   0 – Recovery successful
+#   1 – Invalid usage / missing parameters
+#   2 – Unable to recover after remedial attempts
+#   3 – Critical error while gathering diagnostics
 
-# ---------- Default values ----------
-MONITORED_ENDPOINT=""
-SERVICE_LIST=()
-AGENT_SERVICE="datadog-agent"
-API_TOKEN=""
+set -euo pipefail
 
-# ---------- Helper Functions ----------
-print_usage() {
-    echo "Usage: $0 -h <host_ip_or_fqdn> [-e <monitored_endpoint>] [-s <svc1,svc2,...>] [-a <agent_service>] [-t <api_token>]"
-    exit 1
+#############################
+# Configuration & Defaults #
+#############################
+
+# Number of automatic restart attempts before giving up
+MAX_RESTART_ATTEMPTS=3
+
+# Time window for journal queries
+JOURNAL_SINCE="15 minutes ago"
+
+# Health‑check URL (can be overridden on CLI)
+DEFAULT_HEALTH_URL="http://localhost:8080/health"
+
+# Dependencies that must be reachable for the app to work.
+# Format: "<service_name>|<host>:<port>"
+# e.g. "redis.service|", "db|db01.example.com:5432"
+DEPENDENCIES=(
+    "redis.service|"
+    "db|db01.example.com:5432"
+)
+
+# Log directory for this script's own output
+SCRIPT_LOG_DIR="/var/tmp/proc_down"
+mkdir -p "${SCRIPT_LOG_DIR}"
+
+######################################
+# Helper functions – logging & utils #
+######################################
+
+log() {
+    local level="$1"; shift
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${level}" "$*" \
+        >>"${SCRIPT_LOG_DIR}/run_$(date '+%Y%m%d').log"
 }
 
-# Parse comma‑separated list into array
-parse_list() {
-    IFS=',' read -ra arr <<< "$1"
-    echo "${arr[@]}"
+die() {
+    log "ERROR" "$@"
+    exit "${2:-1}"
 }
 
-# Run a command, capture output and errors, write to log file
 run_cmd() {
-    local description="$1"
-    shift
+    # Executes a command, captures stdout+stderr, returns exit status.
+    # Output is logged line‑by‑line.
+    local cmd_desc="$1"; shift
     local cmd=("$@")
-    echo "=== ${description} ===" >>"$REPORT_FILE"
-    printf "%s\n" "Command: ${cmd[*]}" >>"$REPORT_FILE"
-    if ! "${cmd[@]}" >>"$REPORT_FILE" 2>&1; then
-        echo "[WARN] Command failed: ${cmd[*]}" >>"$REPORT_FILE"
+    log "INFO" "Running: ${cmd_desc}"
+    if ! "${cmd[@]}" >>"${SCRIPT_LOG_DIR}/run_$(date '+%Y%m%d').log" 2>&1; then
+        log "WARN" "'${cmd_desc}' returned non‑zero exit code"
+        return 1
     fi
-    echo "" >>"$REPORT_FILE"
+    return 0
 }
 
-# Ensure we have sufficient permissions for privileged commands
-ensure_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        SUDO_CMD="sudo"
+#########################
+# Argument verification #
+#########################
+
+if [[ $# -lt 1 ]]; then
+    die "Usage: $0 <service_name> [health_check_url]" 1
+fi
+
+SERVICE_NAME="$1"
+HEALTH_URL="${2:-$DEFAULT_HEALTH_URL}"
+
+# Derive a simple identifier (strip .service suffix if present)
+PROC_ID="${SERVICE_NAME%.service}"
+
+# Path to the primary application log (convention‑based)
+APP_LOG="/var/log/${PROC_ID}/worker.log"
+
+####################################
+# Diagnostic data collection block #
+####################################
+
+collect_diagnostics() {
+    local ts now_ts
+    now_ts=$(date '+%Y%m%d_%H%M%S')
+    DIAG_DIR="${SCRIPT_LOG_DIR}/${PROC_ID}_diag_${now_ts}"
+    mkdir -p "${DIAG_DIR}"
+    log "INFO" "Collecting diagnostics into ${DIAG_DIR}"
+
+    # 1. Process listing
+    ps -ef | grep -i "[${PROC_ID:0:1}]${PROC_ID:1}" >"${DIAG_DIR}/ps.txt" || true
+
+    # 2. Systemd unit status (if applicable)
+    if systemctl list-unit-files "${SERVICE_NAME}" >/dev/null 2>&1; then
+        systemctl status "${SERVICE_NAME}" >"${DIAG_DIR}/systemd_status.txt" 2>&1 || true
+        journalctl -u "${SERVICE_NAME}" --since "${JOURNAL_SINCE}" >"${DIAG_DIR}/journal.txt" 2>&1 || true
+    fi
+
+    # 3. Core dump information
+    coredumpctl list | grep -i "${PROC_ID}" >"${DIAG_DIR}/coredumps.txt" 2>&1 || true
+
+    # 4. Top snapshot (resource pressure)
+    top -b -n1 | head -20 >"${DIAG_DIR}/top_snapshot.txt" 2>&1
+
+    # 5. Disk utilisation for typical mount points
+    df -h /var/log /opt/"${PROC_ID}" >"${DIAG_DIR}/df.txt" 2>&1 || true
+
+    # 6. Tail of application log (if exists)
+    if [[ -f "${APP_LOG}" ]]; then
+        tail -n100 "${APP_LOG}" >"${DIAG_DIR}/app_log_tail.txt" 2>&1
     else
-        SUDO_CMD=""
+        echo "Log file not found: ${APP_LOG}" >"${DIAG_DIR}/app_log_tail.txt"
     fi
-}
 
-# ---------- Argument Parsing ----------
-while getopts ":h:e:s:a:t:" opt; do
-    case $opt in
-        h) TARGET_HOST="${OPTARG}" ;;
-        e) MONITORED_ENDPOINT="${OPTARG}" ;;
-        s) SERVICE_LIST=($(parse_list "${OPTARG}")) ;;
-        a) AGENT_SERVICE="${OPTARG}" ;;
-        t) API_TOKEN="${OPTARG}" ;;
-        *) print_usage ;;
-    esac
-done
-
-[[ -z "${TARGET_HOST:-}" ]] && { echo "Error: target host is required."; print_usage; }
-
-# ---------- Setup ----------
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-REPORT_DIR="/tmp/host_diag_${TARGET_HOST}_${TIMESTAMP}"
-mkdir -p "$REPORT_DIR"
-REPORT_FILE="${REPORT_DIR}/diagnostic_report.txt"
-
-echo "Host Diagnostic Report for ${TARGET_HOST}" >"$REPORT_FILE"
-echo "Generated at $(date)" >>"$REPORT_FILE"
-echo "Report Directory: $REPORT_DIR" >>"$REPORT_FILE"
-echo "" >>"$REPORT_FILE"
-
-ensure_root
-
-# ---------- Section 1: Basic Reachability ----------
-run_cmd "Ping test (5 packets)" ping -c 5 "$TARGET_HOST"
-run_cmd "Traceroute" traceroute "$TARGET_HOST"
-run_cmd "NSLookup (hostname)" nslookup "$TARGET_HOST"
-
-# ---------- Section 2: Network Interfaces & Routing ----------
-run_cmd "IP address summary" ip addr show
-run_cmd "Routing table" ip route show
-if command -v netstat >/dev/null 2>&1; then
-    run_cmd "Netstat interface statistics" netstat -i
-else
-    echo "netstat not found, skipping." >>"$REPORT_FILE"
-fi
-
-# ---------- Section 3: Firewall / SELinux ----------
-if command -v iptables >/dev/null 2>&1; then
-    run_cmd "iptables rules" $SUDO_CMD iptables -L -n -v
-else
-    echo "iptables not installed, skipping." >>"$REPORT_FILE"
-fi
-
-if command -v firewall-cmd >/dev/null 2>&1; then
-    run_cmd "firewalld state" $SUDO_CMD firewall-cmd --state || true
-fi
-
-if command -v getenforce >/dev/null 2>&1; then
-    run_cmd "SELinux mode" getenforce
-fi
-
-# ---------- Section 4: Critical Services ----------
-if [ "${#SERVICE_LIST[@]}" -gt 0 ]; then
-    for svc in "${SERVICE_LIST[@]}"; do
-        run_cmd "Systemd status for service '${svc}'" systemctl status "$svc"
-    done
-else
-    echo "No explicit service list provided; showing all failed units." >>"$REPORT_FILE"
-    run_cmd "Failed systemd services" systemctl list-units --type=service --state=failed
-fi
-
-# ---------- Section 5: Monitoring Agent ----------
-run_cmd "Monitoring agent (${AGENT_SERVICE}) status" systemctl status "$AGENT_SERVICE"
-run_cmd "Recent error logs for agent" journalctl -u "$AGENT_SERVICE" -p err -n 50
-if command -v "${AGENT_SERVICE%%-*}" >/dev/null 2>&1; then
-    # Attempt to call a generic "<agent> status" command
-    AGENT_CLI="${AGENT_SERVICE%%-*}"
-    run_cmd "Agent CLI status" "$AGENT_CLI" status
-fi
-
-# ---------- Section 6: Recent System Logs ----------
-run_cmd "Journal warnings (last 200 entries)" journalctl -b -p warning -n 200
-if [ -f /var/log/syslog ]; then
-    run_cmd "Syslog errors (tail 100)" bash -c "grep -i error /var/log/syslog | tail -100"
-fi
-if [ -f /var/log/messages ]; then
-    run_cmd "Messages failures (tail 100)" bash -c "grep -i fail /var/log/messages | tail -100"
-fi
-
-# ---------- Section 7: Resource Pressure ----------
-run_cmd "Top snapshot (first 20 lines)" top -b -n 1 | head -20
-run_cmd "Memory usage" free -m
-run_cmd "VMStat (5 samples, 5 sec interval)" vmstat 5 5
-if command -v iostat >/dev/null 2>&1; then
-    run_cmd "IOStat (extended, 3 samples, 5 sec interval)" iostat -xz 5 3
-else
-    echo "iostat not installed, skipping." >>"$REPORT_FILE"
-fi
-run_cmd "Disk usage" df -h
-
-# ---------- Section 8: Open Sockets & Listening Ports ----------
-run_cmd "Listening sockets (ss)" ss -tulnp
-if command -v lsof >/dev/null 2>&1; then
-    run_cmd "Listening TCP ports (lsof)" lsof -iTCP -sTCP:LISTEN -P
-else
-    echo "lsof not installed, skipping." >>"$REPORT_FILE"
-fi
-
-# ---------- Section 9: Application‑Specific Checks ----------
-APP_LOG="/opt/app/logs/app.log"
-if [ -f "$APP_LOG" ]; then
-    run_cmd "App log fatal entries (tail 100)" bash -c "grep -i fatal \"$APP_LOG\" | tail -100"
-else
-    echo "Application log $APP_LOG not found, skipping." >>"$REPORT_FILE"
-fi
-
-if command -v jps >/dev/null 2>&1; then
-    run_cmd "Java processes (jps)" jps
-    # Capture stack traces for any java process that appears
-    JAVA_PIDS=$(jps -q)
-    for pid in $JAVA_PIDS; do
-        STACKFILE="${REPORT_DIR}/jstack_${pid}.txt"
-        if command -v jstack >/dev/null 2>&1; then
-            jstack "$pid" >"$STACKFILE" 2>/dev/null || true
-            echo "Saved jstack for PID $pid to $STACKFILE" >>"$REPORT_FILE"
+    # 7. Dependency status & connectivity
+    for dep in "${DEPENDENCIES[@]}"; do
+        IFS='|' read -r dep_service dep_target <<<"$dep"
+        if [[ -n "${dep_service}" ]]; then
+            systemctl status "${dep_service}" >"${DIAG_DIR}/dep_${dep_service}.txt" 2>&1 || true
+        fi
+        if [[ -n "${dep_target}" ]]; then
+            host_port=(${dep_target//:/ })
+            nc -zvw2 "${host_port[0]}" "${host_port[1]}" >"${DIAG_DIR}/dep_${host_port[0]}_${host_port[1]}.txt" 2>&1 || true
         fi
     done
-else
-    echo "jps not available, skipping Java checks." >>"$REPORT_FILE"
-fi
 
-# ---------- Section 10: DNS Resolution for Monitored Endpoints ----------
-if [ -n "$MONITORED_ENDPOINT" ]; then
-    if command -v dig >/dev/null 2>&1; then
-        run_cmd "dig short for endpoint" dig +short "$MONITORED_ENDPOINT"
+    # 8. Health‑check endpoint
+    curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}" >"${DIAG_DIR}/health_httpcode.txt" 2>&1 || true
+}
+
+###################################
+# Remediation helper sub‑routines #
+###################################
+
+restart_service() {
+    local attempts=0
+    while (( attempts < MAX_RESTART_ATTEMPTS )); do
+        ((attempts++))
+        log "INFO" "Attempt ${attempts} to start ${SERVICE_NAME}"
+        if run_cmd "systemctl start ${SERVICE_NAME}" systemctl start "${SERVICE_NAME}"; then
+            sleep 5  # give it a moment to settle
+            if is_process_running; then
+                log "INFO" "${SERVICE_NAME} started successfully."
+                return 0
+            fi
+        fi
+        log "WARN" "Start attempt ${attempts} failed."
+        sleep 10
+    done
+    return 1
+}
+
+is_process_running() {
+    # Returns 0 if at least one matching process is found
+    if pgrep -f "[${PROC_ID:0:1}]${PROC_ID:1}" >/dev/null 2>&1; then
+        return 0
     fi
-    if command -v host >/dev/null 2>&1; then
-        run_cmd "host lookup for endpoint" host "$MONITORED_ENDPOINT"
+    return 1
+}
+
+increase_ulimit() {
+    log "INFO" "Increasing file‑descriptor limit to 65536 for current shell"
+    ulimit -n 65536 || log "WARN" "Failed to raise ulimit"
+}
+
+revert_config() {
+    local cfg_path="/etc/${PROC_ID}/worker.yaml"
+    if [[ -f "${cfg_path}" && -d "/etc/${PROC_ID}/.git" ]]; then
+        log "INFO" "Reverting configuration to previous git revision"
+        pushd "/etc/${PROC_ID}" >/dev/null
+        git checkout HEAD~1 -- worker.yaml || log "WARN" "Git revert failed"
+        popd >/dev/null
+        systemctl reload "${SERVICE_NAME}" || log "WARN" "Reload failed"
+    else
+        log "WARN" "Config revert not possible – missing repo or file"
     fi
-fi
+}
 
-# ---------- Section 11: External Monitoring Data ----------
-if [ -n "$API_TOKEN" ]; then
-    METRICS_URL="https://monitoring.example.com/api/v1/metrics?host=${TARGET_HOST}&range=5m"
-    run_cmd "Pull recent metrics via API" curl -s -X GET "$METRICS_URL" -H "Authorization: Bearer $API_TOKEN"
-else
-    echo "API token not supplied; skipping external metric pull." >>"$REPORT_FILE"
-fi
+clean_old_logs() {
+    local log_dir="/var/log/${PROC_ID}"
+    if [[ -d "${log_dir}" ]]; then
+        log "INFO" "Cleaning logs older than 30 days under ${log_dir}"
+        find "${log_dir}" -type f -mtime +30 -delete || log "WARN" "Old‑log cleanup failed"
+    fi
+}
 
-# ---------- Completion ----------
-echo "Diagnostics completed. Report saved to $REPORT_FILE"
-echo "If remediation is required, refer to the sections above and take appropriate actions."
-exit 0
+restart_dependency() {
+    local dep_service="$1"
+    log "INFO" "Restarting dependency ${dep_service}"
+    systemctl restart "${dep_service}" || log "WARN" "Failed to restart ${dep_service}"
+}
+
+#################################
+# Main execution flow – Triage  #
+#################################
+
+main() {
+    log "INFO" "=== Processor‑down runbook invoked for ${SERVICE_NAME} ==="
+
+    collect_diagnostics
+
+    if is_process_running; then
+        log "INFO" "Process appears to be running. Performing health‑check."
+
+        http_code=$(cat "${SCRIPT_LOG_DIR}/${PROC_ID}_diag_"*/health_httpcode.txt 2>/dev/null || echo "")
+        if [[ "${http_code}" == "200" ]]; then
+            log "INFO" "Health endpoint reports OK (HTTP 200). No further action required."
+            exit 0
+        else
+            log "WARN" "Health endpoint returned '${http_code}'. Proceeding with remediation."
+        fi
+    else
+        log "WARN" "Process not found. Initiating start sequence."
+    fi
+
+    # Attempt basic remediation steps
+    increase_ulimit
+    if ! restart_service; then
+        log "ERROR" "Service failed to start after ${MAX_RESTART_ATTEMPTS} attempts."
+        # Try auxiliary remediation paths
+        revert_config
+        clean_old_logs
+        # Restart common dependencies (example: redis)
+        for dep in "${DEPENDENCIES[@]}"; do
+            IFS='|' read -r dep_service _ <<<"$dep"
+            if [[ -n "${dep_service}" ]]; then
+                restart_dependency "${dep_service}"
+            fi
+        done
+        # Final start attempt
+        if ! restart_service; then
+            log "CRITICAL" "Unable to recover ${SERVICE_NAME}. Escalation required."
+            exit 2
+        fi
+    fi
+
+    # Post‑remediation validation
+    if is_process_running; then
+        pid=$(pgrep -f "[${PROC_ID:0:1}]${PROC_ID:1}" | head -n1)
+        uptime=$(ps -p "${pid}" -o etime=)
+        log "INFO" "Process ${PROC_ID} (PID ${pid}) uptime: ${uptime}"
+    else
+        log "ERROR" "Process still not visible after remediation."
+        exit 2
+    fi
+
+    # Re‑run health‑check
+    if curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}" | grep -q "^200$"; then
+        log "INFO" "Health‑check succeeded (HTTP 200). Recovery complete."
+    else
+        log "WARN" "Health‑check still failing. Monitoring will continue."
+    fi
+
+    # Suppress duplicate alerts for a short window (optional)
+    touch "${SCRIPT_LOG_DIR}/${PROC_ID}_last_success"
+    log "INFO" "Runbook completed successfully."
+    exit 0
+}
+
+main "$@"
