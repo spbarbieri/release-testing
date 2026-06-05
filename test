@@ -1,0 +1,162 @@
+#!/bin/bash
+set -euo pipefail
+
+# ----------------------------------------------------------------------
+# Script: diagnose_k8s_node.shffff
+# Purpose: Diagnose common issues on a Kubernetes worker node.
+# Steps:
+#   1) Scan recent kubelet logs for errors or warnings.
+#   2) Verify node visibility via `kubectl get nodes`.
+#   3) If node is invisible, confirm the node has a valid IP address.
+#   4) If node is visible but not Ready, attempt to restart kubelet.
+# ----------------------------------------------------------------------
+
+# ---------- Configuration ----------
+# Adjust these values as needed for your environment.
+KUBELET_SERVICE="kubelet"
+LOG_SINCE="1h"                     # How far back to search logs (e.g., 30m, 2h)
+MAX_LOG_LINES=1000                 # Upper bound when falling back to a file
+IP_INTERFACE="${INTERFACE:-}"      # Optional: limit IP check to a specific interface
+RESTART_TIMEOUT=30                # Seconds to wait after restarting kubelet
+
+# ---------- Helper Functions ----------
+log() {
+    local level="$1"; shift
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*"
+}
+
+exit_error() {
+    log "ERROR" "$@"
+    exit 1
+}
+
+# Return 0 if any line contains "error" or "warning" (case‑insensitive)
+check_logs_for_issues() {
+    local source="$1"
+
+    if [[ -n "${source}" ]]; then
+        # Use journalctl if available for the kubelet service
+        if command -v journalctl >/dev/null; then
+            if journalctl -u "${KUBELET_SERVICE}" --since "${LOG_SINCE}" \
+                | grep -iE 'error|warning' > /dev/null; then
+                log "WARN" "Found error/warning entries in journalctl for ${KUBELET_SERVICE}"
+                journalctl -u "${KUBELET_SERVICE}" --since "${LOG_SINCE}" \
+                    | grep -iE 'error|warning'
+                return 0
+            fi
+        fi
+
+        # Fallback to plain log file if provided
+        if [[ -f "${source}" ]]; then
+            if grep -iE 'error|warning' "${source}" | head -n "${MAX_LOG_LINES}" > /dev/null; then
+                log "WARN" "Found error/warning entries in ${source}"
+                grep -iE 'error|warning' "${source}" | head -n "${MAX_LOG_LINES}"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# Verify that the node appears in `kubectl get nodes`
+node_visible_in_cluster() {
+    local node_name="$1"
+    if ! command -v kubectl >/dev/null; then
+        exit_error "'kubectl' command not found in PATH."
+    fi
+
+    # Suppress noisy output; capture JSON for reliable parsing
+    if kubectl get node "${node_name}" -o json >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Retrieve the Ready condition status (True/False/Unknown)
+node_ready_status() {
+    local node_name="$1"
+    kubectl get node "${node_name}" -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}"
+}
+
+# Show IP addresses configured on the host (optionally filtered by interface)
+show_ip_addresses() {
+    if [[ -n "${IP_INTERFACE}" ]]; then
+        ip -o -4 addr show dev "${IP_INTERFACE}" | awk '{print $4}'
+    else
+        ip -o -4 addr show | awk '{print $4}'
+    fi
+}
+
+# Restart kubelet safely
+restart_kubelet() {
+    log "INFO" "Attempting to restart ${KUBELET_SERVICE}..."
+    if systemctl restart "${KUBELET_SERVICE}"; then
+        log "INFO" "${KUBELET_SERVICE} restarted successfully. Waiting ${RESTART_TIMEOUT}s for stabilization..."
+        sleep "${RESTART_TIMEOUT}"
+    else
+        exit_error "Failed to restart ${KUBELET_SERVICE}."
+    fi
+}
+
+# ---------- Main Execution Flow ----------
+main() {
+    local node_name
+    node_name="$(hostname)"
+    log "INFO" "Diagnosing node '${node_name}'..."
+
+    # 1️⃣ Check kubelet logs for errors/warnings
+    LOG_SOURCE="/var/log/${KUBELET_SERVICE}.log"
+    if check_logs_for_issues "${LOG_SOURCE}"; then
+        log "ERROR" "Log inspection revealed problems above. Resolve them before proceeding."
+        exit 1
+    else
+        log "INFO" "No error or warning entries found in recent logs."
+    fi
+
+    # 2️⃣ Verify node presence via kubectl
+    if node_visible_in_cluster "${node_name}"; then
+        log "INFO" "Node '${node_name}' is visible to the control plane."
+
+        # 3️⃣ Evaluate Ready condition
+        local ready_status
+        ready_status="$(node_ready_status "${node_name}")"
+        log "INFO" "Node Ready status: ${ready_status}"
+
+        if [[ "${ready_status}" == "True" ]]; then
+            log "INFO" "Node is healthy. No further action required."
+            exit 0
+        else
+            log "WARN" "Node is not Ready (status=${ready_status}). Attempting remediation..."
+            restart_kubelet
+
+            # Re‑check after restart
+            if node_visible_in_cluster "${node_name}" && [[ "$(node_ready_status "${node_name}")" == "True" ]]; then
+                log "INFO" "Node recovered and is now Ready."
+                exit 0
+            else
+                log "ERROR" "Node remains unhealthy after kubelet restart."
+                exit 1
+            fi
+        fi
+    else
+        log "WARN" "Node '${node_name}' does NOT appear in 'kubectl get nodes'. Checking network configuration..."
+
+        # 4️⃣ Verify the node has an IP address
+        local ips
+        ips=$(show_ip_addresses)
+        if [[ -z "${ips}" ]]; then
+            log "ERROR" "No IPv4 address detected on the node. Network configuration issue."
+            exit 1
+        else
+            log "INFO" "Detected IP address(es): ${ips}"
+            log "INFO" "Ensure firewall rules/NAT allow traffic to/from the control plane."
+        fi
+
+        # Suggest next steps – cannot automatically fix cluster‑side reachability
+        log "ERROR" "Node is unreachable from the master. Manual network troubleshooting required."
+        exit 1
+    fi
+}
+
+main "$@"
