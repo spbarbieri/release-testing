@@ -1,1 +1,287 @@
-sedrererhvher jbjebbrjebjeb hhgh
+#!/bin/bash
+#
+# Automated triage & diagnostics for “Test per‑process ‘processor down’” alerts
+# ------------------------------------------------------------
+# This script performs the immediate (first 15 min) and detailed diagnostic
+# steps outlined in the runbook. All collected artefacts are saved under a
+# timestamped directory (/tmp/triage_YYYYMMDD_HHMMSS) for later review.
+#
+# Required utilities: ps, git, systemctl, sar, iostat, df, journalctl,
+# tail, grep, dmesg, curl, nc, jq, kubectl (optional), docker (optional)
+#
+# Usage example:
+#   ./triage_alert.sh \
+#       --pid 12345 \
+#       --service myservice \
+#       --repo /opt/myservice/repo \
+#       --log-dir /var/log/myservice \
+#       --health-port 8080 \
+#       --db-host db.example.com \
+#       --mq-host mq.example.com \
+#       --container-id abcdef1234567890 \
+#       --alert-def /etc/prometheus/rules.yml \
+#       --alertmgr-url http://alertmanager.local/api/v2/alerts
+#
+
+set -euo pipefail
+
+###########################
+# Helper Functions
+###########################
+
+log() {
+    local level="$1"; shift
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*"
+}
+
+die() {
+    log "ERROR" "$@"
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found in PATH."
+}
+
+run_and_save() {
+    local cmd_desc="$1"
+    local outfile="$2"
+    shift 2
+    log "INFO" "Running: $cmd_desc"
+    if "$@" >"$outfile" 2>&1; then
+        log "INFO" "Saved output to $outfile"
+    else
+        log "WARN" "Command failed, see $outfile for details"
+    fi
+}
+
+###########################
+# Argument Parsing
+###########################
+
+# Default values (can be overridden)
+PID=""
+SERVICE_NAME=""
+REPO_PATH=""
+LOG_DIR=""
+HEALTH_PORT=""
+DB_HOST=""
+MQ_HOST=""
+CONTAINER_ID=""
+ALERT_DEF_FILE=""
+ALERTMANAGER_URL=""
+
+print_usage() {
+    cat <<EOF
+Usage: $0 [options]
+
+Options:
+  --pid               PID of the affected process
+  --service           Service/unit name (systemd unit)
+  --repo              Path to the service's source repository
+  --log-dir           Directory containing service logs
+  --health-port       Port number of the HTTP health endpoint
+  --db-host           Hostname/IP of the database to probe
+  --mq-host           Hostname/IP of the message queue to probe
+  --container-id      Docker/K8s container ID (if applicable)
+  --alert-def         Path to the alert definition file (YAML/JSON)
+  --alertmgr-url      Base URL of Alertmanager API (e.g., http://am:9093/api/v2/alerts)
+
+Example:
+  $0 --pid 1234 --service mysvc --repo /opt/msvc/repo \\
+     --log-dir /var/log/msvc --health-port 8080 \\
+     --db-host db.internal --mq-host mq.internal \\
+     --container-id abcdef123456 --alert-def /etc/prometheus/rules.yml \\
+     --alertmgr-url http://alertmanager.local/api/v2/alerts
+EOF
+    exit 1
+}
+
+# Simple long‑option parser
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pid)                PID="${2:?Missing value}"; shift 2 ;;
+        --service)            SERVICE_NAME="${2:?Missing value}"; shift 2 ;;
+        --repo)               REPO_PATH="${2:?Missing value}"; shift 2 ;;
+        --log-dir)            LOG_DIR="${2:?Missing value}"; shift 2 ;;
+        --health-port)        HEALTH_PORT="${2:?Missing value}"; shift 2 ;;
+        --db-host)            DB_HOST="${2:?Missing value}"; shift 2 ;;
+        --mq-host)            MQ_HOST="${2:?Missing value}"; shift 2 ;;
+        --container-id)       CONTAINER_ID="${2:?Missing value}"; shift 2 ;;
+        --alert-def)          ALERT_DEF_FILE="${2:?Missing value}"; shift 2 ;;
+        --alertmgr-url)       ALERTMANAGER_URL="${2:?Missing value}"; shift 2 ;;
+        -h|--help)            print_usage ;;
+        *)                    die "Unknown option: $1" ;;
+    esac
+done
+
+# Basic validation
+[[ -n "$PID" ]] || die "--pid is required"
+[[ -n "$SERVICE_NAME" ]] || die "--service is required"
+[[ -n "$LOG_DIR" ]] || die "--log-dir is required"
+
+# Prepare output directory
+TS=$(date '+%Y%m%d_%H%M%S')
+OUTDIR="/tmp/triage_${TS}"
+mkdir -p "$OUTDIR"
+log "INFO" "All artefacts will be stored in $OUTDIR"
+
+###########################
+# Immediate Triage (first 15 min)
+###########################
+
+# 1. Verify alert definition does not contain test flags
+if [[ -n "$ALERT_DEF_FILE" && -f "$ALERT_DEF_FILE" ]]; then
+    require_cmd grep
+    if grep -Ei 'severity:\s*test|test:' "$ALERT_DEF_FILE" >/dev/null; then
+        log "WARN" "Alert definition $ALERT_DEF_FILE contains a test flag/severity."
+    else
+        log "INFO" "No test flag found in alert definition."
+    fi
+else
+    log "INFO" "Skipping alert-definition check (file not supplied or missing)."
+fi
+
+# 2. Confirm process status
+run_and_save "Process status for PID $PID" "$OUTDIR/process_status.txt" \
+    ps -p "$PID" -o pid,ppid,user,%cpu,%mem,cmd
+
+# 3. Recent VCS changes
+if [[ -d "$REPO_PATH/.git" ]]; then
+    run_and_save "Last 5 git commits in $REPO_PATH" "$OUTDIR/git_log.txt" \
+        git -C "$REPO_PATH" log -n 5 --oneline
+else
+    log "WARN" "Repository path $REPO_PATH does not appear to be a Git repo."
+fi
+
+# 4. Monitoring agents health
+for svc in prometheus-node-exporter datadog-agent; do
+    run_and_save "systemctl status $svc" "$OUTDIR/${svc}_status.txt" \
+        systemctl status "$svc"
+done
+
+###########################
+# Detailed Diagnostics
+###########################
+
+# 1. System‑level metrics (collect short samples)
+if command -v sar >/dev/null; then
+    run_and_save "sar CPU (1 sec x10)" "$OUTDIR/sar_cpu.txt" sar -u 1 10
+else
+    log "WARN" "sar not installed – skipping CPU stats."
+fi
+
+if command -v sar >/dev/null; then
+    run_and_save "sar Memory (1 sec x10)" "$OUTDIR/sar_mem.txt" sar -r 1 10
+else
+    log "WARN" "sar not installed – skipping memory stats."
+fi
+
+if command -v iostat >/dev/null; then
+    run_and_save "iostat (1 sec x10)" "$OUTDIR/iostat.txt" iostat -xz 1 10
+else
+    log "WARN" "iostat not installed – skipping I/O stats."
+fi
+
+# Disk space/inodes for service data directory (guess from repo or log dir)
+DATA_DIR="${REPO_PATH:-/var/lib}/${SERVICE_NAME}"
+if [[ -d "$DATA_DIR" ]]; then
+    run_and_save "df -h $DATA_DIR" "$OUTDIR/df_h.txt" df -h "$DATA_DIR"
+    run_and_save "df -i $DATA_DIR" "$OUTDIR/df_i.txt" df -i "$DATA_DIR"
+else
+    log "WARN" "Data directory $DATA_DIR does not exist – skipping df checks."
+fi
+
+# 2. Application logs
+JOURNAL_OUT="$OUTDIR/journalctl.txt"
+run_and_save "journalctl for $SERVICE_NAME (last 5 min)" "$JOURNAL_OUT" \
+    journalctl -u "$SERVICE_NAME" --since "5 minutes ago"
+
+# Tail latest log file (assume standard naming)
+MAIN_LOG="$(find "$LOG_DIR" -type f -name "${SERVICE_NAME}.log" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+if [[ -n "$MAIN_LOG" && -f "$MAIN_LOG" ]]; then
+    run_and_save "tail -n 200 $MAIN_LOG" "$OUTDIR/tail.log.txt" tail -n 200 "$MAIN_LOG"
+    run_and_save "grep errors in $MAIN_LOG" "$OUTDIR/error_grep.txt" \
+        grep -iE "error|exception|kill|shutdown" "$MAIN_LOG" || true
+else
+    log "WARN" "Could not locate main log file for $SERVICE_NAME in $LOG_DIR."
+fi
+
+# 3. Kernel messages
+run_and_save "dmesg OOM/killed/segfault" "$OUTDIR/dmesg.txt" \
+    dmesg | grep -i -E "oom|killed process|segfault" || true
+
+# 4. Health endpoint
+if [[ -n "$HEALTH_PORT" ]]; then
+    HEALTH_URL="http://127.0.0.1:${HEALTH_PORT}/healthz"
+    run_and_save "curl health endpoint $HEALTH_URL" "$OUTDIR/health_curl.txt" \
+        curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL"
+else
+    log "INFO" "Health port not supplied – skipping health‑endpoint check."
+fi
+
+# Optional internal diagnostics script
+DIAG_SCRIPT="/opt/${SERVICE_NAME}/bin/diagnose.sh"
+if [[ -x "$DIAG_SCRIPT" ]]; then
+    run_and_save "Run internal diagnostics" "$OUTDIR/internal_diag.txt" \
+        "$DIAG_SCRIPT" --verbose
+else
+    log "INFO" "Diagnostics script $DIAG_SCRIPT not present or not executable."
+fi
+
+# 5. Dependency connectivity
+if [[ -n "$DB_HOST" ]]; then
+    run_and_save "nc to DB $DB_HOST:5432" "$OUTDIR/nc_db.txt" nc -zvw3 "$DB_HOST" 5432 || true
+fi
+if [[ -n "$MQ_HOST" ]]; then
+    run_and_save "nc to MQ $MQ_HOST:5672" "$OUTDIR/nc_mq.txt" nc -zvw3 "$MQ_HOST" 5672 || true
+fi
+
+# 6. Resource limits (Docker/K8s)
+if [[ -n "$CONTAINER_ID" ]]; then
+    CGROUP_MEM="/sys/fs/cgroup/memory/docker/${CONTAINER_ID}/memory.limit_in_bytes"
+    if [[ -f "$CGROUP_MEM" ]]; then
+        run_and_save "Container memory limit" "$OUTDIR/container_memory_limit.txt" cat "$CGROUP_MEM"
+    else
+        log "WARN" "Cgroup memory file $CGROUP_MEM not found."
+    fi
+fi
+
+# Kubernetes pod description (requires kubectl + env vars)
+if command -v kubectl >/dev/null && [[ -n "${KUBE_POD_NAME:-}" && -n "${KUBE_NAMESPACE:-}" ]]; then
+    run_and_save "kubectl describe pod $KUBE_POD_NAME" "$OUTDIR/kubectl_describe.txt" \
+        kubectl describe pod "$KUBE_POD_NAME" -n "$KUBE_NAMESPACE"
+else
+    log "INFO" "Kubectl not available or KUBE_POD_NAME/KUBE_NAMESPACE not set – skipping k8s inspection."
+fi
+
+# 7. Correlate other alerts via Alertmanager API
+if [[ -n "$ALERTMANAGER_URL" ]]; then
+    require_cmd curl
+    require_cmd jq
+    run_and_save "Query Alertmanager for recent alerts" "$OUTDIR/alertmanager.json" \
+        curl -sG "$ALERTMANAGER_URL" --data-urlencode "receiver=all" | jq . || true
+else
+    log "INFO" "Alertmanager URL not supplied – skipping cross‑alert correlation."
+fi
+
+###########################
+# Completion Summary
+###########################
+log "INFO" "Diagnostic collection complete."
+log "INFO" "Review all artefacts in $OUTDIR"
+log "INFO" "Suggested next steps:"
+cat <<EOS
+
+1. Examine $OUTDIR/process_status.txt to verify whether the PID is alive.
+2. Review $OUTDIR/dmesg.txt and $OUTDIR/error_grep.txt for OOM or fatal errors.
+3. If the process is dead, consider restarting:
+     sudo systemctl restart $SERVICE_NAME
+   or, for Kubernetes:
+     kubectl rollout restart deployment/<deployment-name> -n <namespace>
+
+4. If OOM was observed, adjust memory limits (see runbook).
+5. Communicate findings to the incident channel and document remediation.
+
+EOS
+exit 0
