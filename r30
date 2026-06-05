@@ -1,0 +1,342 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# Script:   per_process_processor_down_triage.sh
+# Purpose:  Automated triage and diagnostics for “Test per‑process ‘processor down’”
+#           alerts. Collects system metrics, logs, health checks, and related
+#           information, storing everything in a timestamped report directory.
+#
+# Usage:    ./per_process_processor_down_triage.sh \
+#               --pid <PID> \
+#               --service <service_name> \
+#               [--repo-path </path/to/repo>] \
+#               [--log-dir </var/log/<service>>] \
+#               [--health-url http://localhost:8080/healthz] \
+#               [--diag-script /opt/<service>/bin/diagnose.sh] \
+#               [--db-host <host> --db-port <port>] \
+#               [--mq-host <host> --mq-port <port>] \
+#               [--container-id <cid>] \
+#               [--pod-name <pod> --namespace <ns>] \
+#               [--alertdef </path/to/alert.yml>] \
+#               [--alertmanager-url http://alertmanager/api/v2/alerts]
+#
+# All options are optional except --pid and --service. Missing pieces are simply
+# skipped with a warning.
+# ==============================================================================
+
+# --------------------------- Helper Functions ---------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $0 --pid <PID> --service <service_name> [options]
+
+Required:
+  --pid                Process ID to investigate
+  --service            Service/unit name (systemd unit, journal identifier)
+
+Optional:
+  --repo-path          Path to the service's Git repository
+  --log-dir            Directory containing plain text logs
+  --health-url         HTTP(S) URL of the service health endpoint
+  --diag-script        Path to an internal diagnostics script
+  --db-host,--db-port  Database host and port for connectivity test
+  --mq-host,--mq-port  Message queue host and port for connectivity test
+  --container-id       Docker/container ID for cgroup inspection
+  --pod-name,--namespace
+                       Kubernetes pod name and namespace
+  --alertdef           File containing the alert definition (YAML/JSON)
+  --alertmanager-url   Base URL of Alertmanager API (for related alerts)
+
+Example:
+  $0 --pid 12345 --service myapp \\
+     --repo-path /srv/myapp \\
+     --log-dir /var/log/myapp \\
+     --health-url http://localhost:8080/healthz \\
+     --diag-script /opt/myapp/bin/diagnose.sh \\
+     --db-host db.example.com --db-port 5432 \\
+     --mq-host mq.example.com --mq-port 5672 \\
+     --container-id abcdef123456 \\
+     --pod-name myapp-pod-abcde --namespace prod \\
+     --alertdef /etc/alertmanager/rules.yml \\
+     --alertmanager-url http://alertmanager:9093
+EOF
+    exit 1
+}
+
+log_msg() {
+    local level="\$1"; shift
+    printf '[%s] %s\n' "\$(date +'%Y-%m-%d %H:%M:%S')" "\${level}: \$*"
+}
+
+require_cmd() {
+    command -v "\$1" >/dev/null 2>&1 || {
+        log_msg "ERROR" "Command '\$1' not found. Please install it."
+        exit 1
+    }
+}
+
+# --------------------------- Argument Parsing ---------------------------------
+
+declare -A ARGS=(
+    [pid]=""
+    [service]=""
+    [repo_path]=""
+    [log_dir]=""
+    [health_url]=""
+    [diag_script]=""
+    [db_host]=""
+    [db_port]=""
+    [mq_host]=""
+    [mq_port]=""
+    [container_id]=""
+    [pod_name]=""
+    [namespace]=""
+    [alertdef]=""
+    [alertmanager_url]=""
+)
+
+while (( "\$#" )); do
+    case "\$1" in
+        --pid)                 ARGS[pid]="\$2"; shift 2 ;;
+        --service)             ARGS[service]="\$2"; shift 2 ;;
+        --repo-path)           ARGS[repo_path]="\$2"; shift 2 ;;
+        --log-dir)             ARGS[log_dir]="\$2"; shift 2 ;;
+        --health-url)          ARGS[health_url]="\$2"; shift 2 ;;
+        --diag-script)         ARGS[diag_script]="\$2"; shift 2 ;;
+        --db-host)             ARGS[db_host]="\$2"; shift 2 ;;
+        --db-port)             ARGS[db_port]="\$2"; shift 2 ;;
+        --mq-host)             ARGS[mq_host]="\$2"; shift 2 ;;
+        --mq-port)             ARGS[mq_port]="\$2"; shift 2 ;;
+        --container-id)        ARGS[container_id]="\$2"; shift 2 ;;
+        --pod-name)            ARGS[pod_name]="\$2"; shift 2 ;;
+        --namespace)           ARGS[namespace]="\$2"; shift 2 ;;
+        --alertdef)            ARGS[alertdef]="\$2"; shift 2 ;;
+        --alertmanager-url)    ARGS[alertmanager_url]="\$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) log_msg "WARN" "Unknown option: \$1"; usage ;;
+    esac
+done
+
+[[ -z "\${ARGS[pid]}" ]] && { log_msg "ERROR" "--pid is required"; usage; }
+[[ -z "\${ARGS[service]}" ]] && { log_msg "ERROR" "--service is required"; usage; }
+
+# --------------------------- Environment Setup -------------------------------
+
+TIMESTAMP=\$(date +%Y%m%dT%H%M%S)
+REPORT_ROOT="/tmp/triage_report_\${TIMESTAMP}"
+mkdir -p "\$REPORT_ROOT"
+
+log_msg "INFO" "Report directory created at \$REPORT_ROOT"
+
+# Ensure essential utilities are available
+for cmd in ps git systemctl sar iostat df journalctl grep dmesg curl nc jq; do
+    require_cmd "\$cmd"
+done
+
+# --------------------------- Step Implementations ----------------------------
+
+check_alert_definition() {
+    local def_file="\${ARGS[alertdef]}"
+    if [[ -z "\$def_file" ]]; then
+        log_msg "INFO" "No alert definition file supplied; skipping test‑flag check."
+        return
+    fi
+    if [[ ! -f "\$def_file" ]]; then
+        log_msg "WARN" "Alert definition file '\$def_file' does not exist."
+        return
+    fi
+    if grep -Ei 'test|severity:\s*test' "\$def_file" >"\$REPORT_ROOT/alert_definition_check.txt"; then
+        log_msg "WARN" "Potential test flag detected in alert definition (see alert_definition_check.txt)"
+    else
+        log_msg "INFO" "No test flags found in alert definition."
+    fi
+}
+
+collect_process_status() {
+    local pid="\${ARGS[pid]}"
+    ps -p "\$pid" -o pid,ppid,user,%cpu,%mem,cmd >"\$REPORT_ROOT/process_status.txt" || {
+        log_msg "ERROR" "Process with PID \$pid not found."
+        return
+    }
+    log_msg "INFO" "Collected process status for PID \$pid."
+}
+
+collect_recent_deployments() {
+    local repo="\${ARGS[repo_path]}"
+    if [[ -z "\$repo" ]]; then
+        log_msg "INFO" "Repository path not provided; skipping git log."
+        return
+    fi
+    if [[ ! -d "\$repo/.git" ]]; then
+        log_msg "WARN" "Directory '\$repo' is not a Git repository."
+        return
+    fi
+    pushd "\$repo" >/dev/null
+    git log -n 5 --oneline >"\$REPORT_ROOT/git_recent.log"
+    popd >/dev/null
+    log_msg "INFO" "Saved recent git commits."
+}
+
+check_monitoring_agents() {
+    {
+        systemctl status prometheus-node-exporter >"\$REPORT_ROOT/prometheus_node_exporter.status" 2>&1 || true
+        systemctl status datadog-agent >"\$REPORT_ROOT/datadog_agent.status" 2>&1 || true
+    }
+    log_msg "INFO" "Recorded monitoring agent statuses."
+}
+
+collect_system_metrics() {
+    {
+        sar -u 1 10 >"\$REPORT_ROOT/sar_cpu.txt" 2>&1 || true
+        sar -r 1 10 >"\$REPORT_ROOT/sar_mem.txt" 2>&1 || true
+        iostat -xz 1 10 >"\$REPORT_ROOT/iostat.txt" 2>&1 || true
+    }
+    log_msg "INFO" "Captured CPU, memory, and I/O statistics."
+}
+
+collect_disk_usage() {
+    local dir=""
+    # Attempt to infer service data directory from service name
+    if [[ -d "/var/lib/\${ARGS[service]}" ]]; then
+        dir="/var/lib/\${ARGS[service]}"
+    elif [[ -n "\${ARGS[log_dir]}" ]]; then
+        dir="\${ARGS[log_dir]}"
+    fi
+
+    if [[ -z "\$dir" ]]; then
+        log_msg "INFO" "No service-specific directory detected; skipping disk usage."
+        return
+    fi
+
+    df -h "\$dir" >"\$REPORT_ROOT/disk_space.txt"
+    df -i "\$dir" >"\$REPORT_ROOT/disk_inode.txt"
+    log_msg "INFO" "Disk usage for \$dir recorded."
+}
+
+collect_application_logs() {
+    local svc="\${ARGS[service]}"
+    local log_dir="\${ARGS[log_dir]}"
+
+    # Journalctl (systemd)
+    journalctl -u "\$svc" --since "5 minutes ago" >"\$REPORT_ROOT/journal_\\\${svc}.txt" 2>&1 || true
+
+    # Plain file logs if directory supplied
+    if [[ -n "\$log_dir" && -d "\$log_dir" ]]; then
+        local latest_log=\$(ls -1t "\$log_dir"/*.log 2>/dev/null | head -n1 || true)
+        if [[ -n "\$latest_log" ]]; then
+            tail -n 200 "\$latest_log" >"\$REPORT_ROOT/tail_\\\$(basename "\$latest_log")"
+            grep -iE "error|exception|kill|shutdown" "\$latest_log" >"\$REPORT_ROOT/error_grep_\\\$(basename "\$latest_log")" 2>&1 || true
+        fi
+    fi
+    log_msg "INFO" "Application logs collected."
+}
+
+check_kernel_messages() {
+    dmesg | grep -i -E "oom|killed process|segfault" >"\$REPORT_ROOT/dmesg_oom.txt" 2>&1 || true
+    log_msg "INFO" "Kernel OOM/killed messages captured."
+}
+
+perform_health_check() {
+    local url="\${ARGS[health_url]}"
+    if [[ -z "\$url" ]]; then
+        log_msg "INFO" "Health URL not provided; skipping curl check."
+        return
+    fi
+    local rc
+    rc=\$(curl -s -o /dev/null -w "%{http_code}" "\$url" || echo "curl_failed")
+    echo "HTTP_CODE=\$rc" >"\$REPORT_ROOT/health_check.txt"
+    log_msg "INFO" "Health endpoint returned HTTP code: \$rc"
+}
+
+run_internal_diagnostics() {
+    local script="\${ARGS[diag_script]}"
+    if [[ -z "\$script" ]]; then
+        log_msg "INFO" "Diagnostics script not specified; skipping."
+        return
+    fi
+    if [[ ! -x "\$script" ]]; then
+        log_msg "WARN" "Diagnostics script '\$script' not executable or missing."
+        return
+    fi
+    "\$script" --verbose >"\$REPORT_ROOT/internal_diag.txt" 2>&1 || true
+    log_msg "INFO" "Executed internal diagnostics script."
+}
+
+check_dependency_connectivity() {
+    # Database
+    if [[ -n "\${ARGS[db_host]}" && -n "\${ARGS[db_port]}" ]]; then
+        nc -zvw3 "\${ARGS[db_host]}" "\${ARGS[db_port]}" >"\$REPORT_ROOT/db_connectivity.txt" 2>&1 || true
+        log_msg "INFO" "Database connectivity test completed."
+    fi
+
+    # Message Queue
+    if [[ -n "\${ARGS[mq_host]}" && -n "\${ARGS[mq_port]}" ]]; then
+        nc -zvw3 "\${ARGS[mq_host]}" "\${ARGS[mq_port]}" >"\$REPORT_ROOT/mq_connectivity.txt" 2>&1 || true
+        log_msg "INFO" "Message queue connectivity test completed."
+    fi
+}
+
+inspect_cgroup_limits() {
+    local cid="\${ARGS[container_id]}"
+    if [[ -z "\$cid" ]]; then
+        log_msg "INFO" "Container ID not supplied; skipping cgroup inspection."
+        return
+    fi
+    local mem_limit_path="/sys/fs/cgroup/memory/docker/\$cid/memory.limit_in_bytes"
+    if [[ -f "\$mem_limit_path" ]]; then
+        cat "\$mem_limit_path" >"\$REPORT_ROOT/cgroup_memory_limit.txt"
+        log_msg "INFO" "Cgroup memory limit recorded."
+    else
+        log_msg "WARN" "Cgroup memory limit file not found for container ID \$cid."
+    fi
+}
+
+kubectl_inspect_pod() {
+    local pod="\${ARGS[pod_name]}"
+    local ns="\${ARGS[namespace]}"
+    if [[ -z "\$pod" || -z "\$ns" ]]; then
+        log_msg "INFO" "Kubernetes pod name/namespace not fully provided; skipping kubectl inspect."
+        return
+    fi
+    require_cmd kubectl
+    kubectl describe pod "\$pod" -n "\$ns" >"\$REPORT_ROOT/kubectl_pod_desc.txt" 2>&1 || true
+    log_msg "INFO" "Kubectl pod description saved."
+}
+
+query_related_alerts() {
+    local am_url="\${ARGS[alertmanager_url]}"
+    if [[ -z "\$am_url" ]]; then
+        log_msg "INFO" "Alertmanager URL not supplied; skipping related alerts query."
+        return
+    fi
+    require_cmd jq
+    curl -sG "\$am_url" --data-urlencode "receiver=all" |
+        jq . >"\$REPORT_ROOT/related_alerts.json" 2>/dev/null || true
+    log_msg "INFO" "Fetched related alerts from Alertmanager."
+}
+
+# --------------------------- Execution Flow ----------------------------------
+
+log_msg "INFO" "Starting triage for PID \${ARGS[pid]}, service '\${ARGS[service]}'"
+
+check_alert_definition
+collect_process_status
+collect_recent_deployments
+check_monitoring_agents
+collect_system_metrics
+collect_disk_usage
+collect_application_logs
+check_kernel_messages
+perform_health_check
+run_internal_diagnostics
+check_dependency_connectivity
+inspect_cgroup_limits
+kubectl_inspect_pod
+query_related_alerts
+
+log_msg "INFO" "Triage complete. All artifacts stored in \$REPORT_ROOT"
+log_msg "INFO" "To review, you may tar the directory:"
+echo "tar czf per_process_triage_\${TIMESTAMP}.tgz -C \"\$REPORT_ROOT\" ."
+
+exit 0
