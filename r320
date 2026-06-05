@@ -1,1 +1,224 @@
-test 12
+#!/bin/bash
+#
+# MQ Depth Event Diagnostic & Remediation Script
+# Event: MQDepthEventTest03 – Owner: John Doe
+#
+# This script performs the diagnostic steps outlined in the incident response
+# guide, captures relevant MQ statistics, system metrics, and optionally applies
+# short‑term remediation actions (increase MAXDEPTH, purge messages, restart
+# consumers). All output is stored in a timestamped results directory.
+#
+# Requirements:
+#   - IBM MQ client utilities (runmqsc, dspmsglog) available in PATH
+#   - Sufficient permissions to query MQ objects and issue ALTER/CLEAR commands
+#   - Optional: access to application log directories for grep searches
+#
+# Usage example:
+#   ./mq_depth_event.sh -q MY.Q.NAME -m QM1 \
+#       [-n 50000] [-c 100] [-l "/opt/app/log/*.log"] [-r]
+#
+# Options:
+#   -q <queue_name>      : Local queue to investigate (required)
+#   -m <qmgr_name>       : Queue manager name (required)
+#   -n <new_maxdepth>    : New temporary MAXDEPTH value (optional)
+#   -c <purge_count>     : Number of oldest messages to CLEAR (optional)
+#   -l <log_path_glob>   : Glob pattern for application logs to scan (optional)
+#   -r                   : Restart consumer processes (placeholder action)
+#   -h                   : Show help and exit
+#
+
+set -euo pipefail
+
+###########################
+# Global variables / defaults
+###########################
+QUEUE_NAME=""
+QMGRCMD=""
+NEW_MAXDEPTH=""
+PURGE_COUNT=""
+APP_LOG_GLOB=""
+RESTART_CONSUMERS=false
+RESULT_BASEDIR="/tmp"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+RESULT_DIR="${RESULT_BASEDIR}/mq_depth_event_${TIMESTAMP}"
+EVENT_NAME="MQDepthEventTest03"
+
+###########################
+# Helper Functions
+###########################
+
+usage() {
+    cat <<EOF
+Usage: $0 -q <queue_name> -m <qmgr_name> [options]
+
+Required:
+  -q <queue_name>        Name of the local queue to diagnose
+  -m <qmgr_name>         Queue manager containing the queue
+
+Optional:
+  -n <new_maxdepth>      Temporary new MAXDEPTH value to apply
+  -c <purge_count>       Number of oldest messages to CLEAR from the queue
+  -l <log_path_glob>     Glob pattern pointing to application log files
+  -r                     Restart consumer processes (customize as needed)
+  -h                     Display this help message
+EOF
+    exit 1
+}
+
+log_msg() {
+    local level="\${1}"
+    local msg="\${2}"
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [\${level}] \${msg}" | tee -a "\${RESULT_DIR}/script.log"
+}
+
+run_mqsc() {
+    local cmd="\${1}"
+    log_msg "INFO" "Executing MQSC command: \${cmd}"
+    runmqsc "\${QMGRCMD}" <<EOF >"\${RESULT_DIR}/\${cmd//[[:space:]]/_}.out" 2>&1
+\${cmd}
+EOF
+    log_msg "INFO" "Result saved to \${RESULT_DIR}/\${cmd//[[:space:]]/_}.out"
+}
+
+gather_system_metrics() {
+    log_msg "INFO" "Collecting system metrics (top, vmstat, iostat)..."
+    mkdir -p "\${RESULT_DIR}/system_metrics"
+
+    # Snapshot of top for the MQ process(es)
+    local mq_pids
+    mq_pids=\$(pgrep -f amqzmgr || true)
+    if [[ -n "\${mq_pids}" ]]; then
+        top -b -n 1 -p "\$(echo \${mq_pids} | tr ' ' ',')" >"\${RESULT_DIR}/system_metrics/top.out"
+    else
+        echo "No MQ manager process found." >"\${RESULT_DIR}/system_metrics/top.out"
+    fi
+
+    vmstat 5 12 >"\${RESULT_DIR}/system_metrics/vmstat.out"
+    iostat -x 5 12 >"\${RESULT_DIR}/system_metrics/iostat.out"
+    log_msg "INFO" "System metrics collected."
+}
+
+search_application_logs() {
+    if [[ -z "\${APP_LOG_GLOB}" ]]; then
+        log_msg "WARN" "No application log glob provided; skipping log search."
+        return
+    fi
+
+    log_msg "INFO" "Scanning application logs for queue‑related errors..."
+    mkdir -p "\${RESULT_DIR}/app_logs"
+    shopt -s nullglob
+    local matches=(\${APP_LOG_GLOB})
+    shopt -u nullglob
+
+    if (( \${#matches[@]} == 0 )); then
+        log_msg "WARN" "No log files matched pattern '\${APP_LOG_GLOB}'."
+        return
+    fi
+
+    for logfile in "\${matches[@]}"; do
+        grep -Ei "(queue full|back[- ]?off|put failed)" "\${logfile}" >>"\${RESULT_DIR}/app_logs/queue_errors.log" || true
+    done
+    log_msg "INFO" "Application log search completed. Results in app_logs/queue_errors.log"
+}
+
+apply_short_term_remediation() {
+    if [[ -n "\${NEW_MAXDEPTH}" ]]; then
+        log_msg "INFO" "Applying temporary MAXDEPTH=\${NEW_MAXDEPTH} to queue \${QUEUE_NAME}"
+        run_mqsc "ALTER QLOCAL(\${QUEUE_NAME}) MAXDEPTH(\${NEW_MAXDEPTH})"
+    fi
+
+    if [[ -n "\${PURGE_COUNT}" && "\${PURGE_COUNT}" != "0" ]]; then
+        log_msg "INFO" "Purging \${PURGE_COUNT} oldest NORMAL messages from queue \${QUEUE_NAME}"
+        run_mqsc "CLEAR QLOCAL(\${QUEUE_NAME}) MSGTYPE(NORMAL) COUNT(\${PURGE_COUNT})"
+    fi
+
+    if \${RESTART_CONSUMERS}; then
+        log_msg "INFO" "Restarting consumer processes (placeholder implementation)."
+        # Placeholder: adapt to your environment, e.g., systemctl restart my_consumer.service
+        # Example:
+        # systemctl restart my_consumer.service
+        log_msg "INFO" "Consumer restart command executed (modify as required)."
+    fi
+}
+
+###########################
+# Main Execution Flow
+###########################
+
+while getopts ":q:m:n:c:l:rh" opt; do
+    case "\${opt}" in
+        q) QUEUE_NAME="\${OPTARG}" ;;
+        m) QMGRCMD="\${OPTARG}" ;;
+        n) NEW_MAXDEPTH="\${OPTARG}" ;;
+        c) PURGE_COUNT="\${OPTARG}" ;;
+        l) APP_LOG_GLOB="\${OPTARG}" ;;
+        r) RESTART_CONSUMERS=true ;;
+        h) usage ;;
+        *) echo "Invalid option: -\${OPTARG}" >&2; usage ;;
+    esac
+done
+
+# Validate mandatory inputs
+if [[ -z "\${QUEUE_NAME}" || -z "\${QMGRCMD}" ]]; then
+    echo "Error: Both queue name (-q) and queue manager (-m) are required." >&2
+    usage
+fi
+
+mkdir -p "\${RESULT_DIR}"
+log_msg "INFO" "Starting MQ Depth Event diagnostic for queue '\${QUEUE_NAME}' on manager '\${QMGRCMD}'."
+log_msg "INFO" "Results will be stored in '\${RESULT_DIR}'."
+
+##############################################
+# 1. Immediate Impact Assessment
+##############################################
+
+log_msg "INFO" "Assessing potential producer/consumer blockages."
+
+# Capture channel status overview
+run_mqsc "DISPLAY CHANNEL(*) STATUS"
+
+# Capture any stopped channels (status = INACTIVE or STOPPED)
+run_mqsc "DISPLAY CHANNEL(*) WHERE(CHLTYPE EQ CHR) STATUS"
+
+##############################################
+# 2. Diagnostic Procedure
+##############################################
+
+log_msg "INFO" "Gathering queue statistics (CURDEPTH, MAXDEPTH)."
+run_mqsc "DISPLAY QLOCAL(\${QUEUE_NAME}) CURDEPTH MAXDEPTH"
+
+log_msg "INFO" "Reviewing recent message flow (PUTS/GETS)."
+run_mqsc "DISPLAY QSTATUS(\${QUEUE_NAME}) TYPE(MSG) ALL"
+
+log_msg "INFO" "Extracting event log entries for ${EVENT_NAME} (last 30 days)."
+run_mqsc "DSPMSGLOG -m \${QMGRCMD} -s ${EVENT_NAME} -b \$(date -d '-30 days' +%Y%m%d) -e \$(date +%Y%m%d)"
+
+log_msg "INFO" "Checking overall channel statuses."
+run_mqsc "DISPLAY CHANNEL(*) STATUS"
+
+# Application log inspection (optional)
+search_application_logs
+
+# System resource utilization
+gather_system_metrics
+
+##############################################
+# 3. Optional Short‑Term Remediation
+##############################################
+if [[ -n "\${NEW_MAXDEPTH}" ]] || [[ -n "\${PURGE_COUNT}" ]] || \${RESTART_CONSUMERS}; then
+    log_msg "INFO" "User requested short‑term remediation actions."
+    apply_short_term_remediation
+else
+    log_msg "INFO" "No short‑term remediation options supplied."
+fi
+
+##############################################
+# 4. Post‑Remediation Validation
+##############################################
+log_msg "INFO" "Validating queue depth after any remedial actions."
+run_mqsc "DISPLAY QLOCAL(\${QUEUE_NAME}) CURDEPTH"
+
+log_msg "INFO" "Diagnostic run complete. Review all captured files in '\${RESULT_DIR}'."
+log_msg "INFO" "Ownership: John Doe (primary), MQ Ops Lead (secondary)."
+
+exit 0
