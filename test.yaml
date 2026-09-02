@@ -1,35 +1,4 @@
-- name: Find largest file in a directory
-      # Prevent execution if the target is missing or not a directory
-
-    - name: Locate the largest regular file under {{ search_dir }}
-      block:
-        - name: Execute find, sort by size, and capture the top entry
-          ansible.builtin.command: >
-            find {{ search_dir }} -type f -printf '%s %p\n' |
-            sort -nr |
-            head -n 1
-          args:
-            warn: false
-          register: find_result
-          changed_when: false
-          # Command returns a single line: "<size> <full_path>"
-
-        - name: Extract size and path from command output
-          ansible.builtin.set_fact:
-            largest_file_size_bytes: "{{ find_result.stdout.split(' ')[0] | int }}"
-            largest_file_path: "{{ find_result.stdout.split(' ', 1)[1] }}"
-          when: find_result.stdout != ''
-          # Split only on first space to preserve spaces inside filenames
-
-        - name: Show the identified largest file
-          ansible.builtin.debug:
-            msg: "Largest file: {{ largest_file_path }} ({{ largest_file_size_bytes }} bytes)"
-          when: largest_file_path is defined
-      rescue:
-        - name: Report failure to determine the largest file
-          ansible.builtin.debug:
-            msg: >-
-              Failed to locate the largest file in {{ search_dir }}.
+           Failed to locate the largest file in {{ search_dir }}.
               Error: {{ ansible_failed_result.msg }}
       always:
         - name: Clear temporary facts for subsequent runs
