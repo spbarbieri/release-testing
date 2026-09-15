@@ -1,0 +1,33 @@
+- name: List files on remote VMs
+  hosts: "{{ target_group | default('target_vms') }}"   # inventory group containing the VMs
+  become: false
+  gather_facts: false
+
+  vars:
+    list_path: "."                     # directory to list; can be overridden per host/group
+    list_command: "ls -alh {{ list_path }}"
+
+  tasks:
+    - name: Execute directory listing
+      block:
+        - name: Run ls -alh on remote host
+          ansible.builtin.command: "{{ list_command }}"
+          register: ls_result
+          changed_when: false                         # read‑only operation, no state change
+          args:
+            warn: false                               # suppress deprecation warnings for plain command
+
+        - name: Show listing output
+          ansible.builtin.debug:
+            var: ls_result.stdout_lines
+
+      rescue:
+        - name: Report listing failure
+          ansible.builtin.debug:
+            msg: >-
+              Failed to execute '{{ list_command }}' on {{ inventory_hostname }}.
+              Error: {{ ansible_failed_result.msg }}
+
+      always:
+        - name: Clean up any host errors
+          meta: clear_host_errors                       # ensures subsequent plays aren't blocked

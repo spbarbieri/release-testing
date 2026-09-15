@@ -1,0 +1,272 @@
+- name: Diagnose and remediate high load during Turbo test
+  hosts: turbo_hosts
+  become: true
+  vars:
+    # Paths and identifiers
+    turbo_test_config_path: "/opt/turbo/tests/turbo_test.yaml"
+    turbo_test_service_name: "turbo-test"          # systemd unit managing the test
+    cgroup_name: "turbo_test"
+    cgroup_cpu_quota_us: 80000                     # 80 % of a single CPU
+    io_scheduler_device: "{{ lookup('pipe', \"lsblk -dn -o NAME | head -1\") }}"
+    diagnostic_dir_base: "/var/tmp/turbo_diag"
+    load_threshold: 8.0
+    maintenance_duration: "30m"
+    email_recipient: "ops@example.com"
+    email_subject: "[{{ inventory_hostname }}] Turbo test load remediation report"
+    # Commands
+    cmd_top: "top -b -n 1"
+    cmd_ps: "ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -20"
+    cmd_vmstat: "vmstat 5 3"
+    cmd_iostat: "iostat -xz 5 3"
+    cmd_sar: "sar -n DEV 1 5"
+    cmd_turbo_recs: "turboctl show recommendations --host $(hostname)"
+    cmd_mpstat: "mpstat -P ALL 1 5"
+    cmd_numactl: "numactl --hardware"
+    cmd_policies: "turboctl get policies --host $(hostname)"
+    cmd_events: "turboctl events list --host $(hostname) --type LOAD_HIGH --last 60m"
+  tasks:
+
+  - name: Ensure required packages are installed
+    ansible.builtin.package:
+      name:
+        - sysstat       # provides iostat, sar, mpstat
+        - cgroup-tools  # provides cgcreate, cgclassify
+      state: present
+    tags: packages
+
+  - name: Create base diagnostic directory
+    ansible.builtin.file:
+      path: "{{ diagnostic_dir_base }}/{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}"
+      state: directory
+      mode: "0755"
+    register: diag_dir
+
+  - block:
+      - name: Capture real-time load with top
+        ansible.builtin.shell: "{{ cmd_top }}"
+        register: out_top
+
+      - name: Save top output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/top.txt"
+          content: "{{ out_top.stdout }}"
+
+      - name: Snapshot top CPU consuming processes
+        ansible.builtin.shell: "{{ cmd_ps }}"
+        register: out_ps
+
+      - name: Save ps snapshot
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/ps_snapshot.txt"
+          content: "{{ out_ps.stdout }}"
+
+      - name: Record vmstat scheduling queues
+        ansible.builtin.shell: "{{ cmd_vmstat }}"
+        register: out_vmstat
+
+      - name: Save vmstat output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/vmstat.txt"
+          content: "{{ out_vmstat.stdout }}"
+
+      - name: Gather disk I/O statistics
+        ansible.builtin.shell: "{{ cmd_iostat }}"
+        register: out_iostat
+
+      - name: Save iostat output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/iostat.txt"
+          content: "{{ out_iostat.stdout }}"
+
+      - name: Capture network packet rates
+        ansible.builtin.shell: "{{ cmd_sar }}"
+        register: out_sar
+
+      - name: Save sar output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/sar.txt"
+          content: "{{ out_sar.stdout }}"
+
+      - name: Export Turbonomic recommendations
+        ansible.builtin.shell: "{{ cmd_turbo_recs }}"
+        register: out_turbo_recs
+        ignore_errors: true   # turboctl may not be present on all nodes
+
+      - name: Save Turbonomic recommendations
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/turbo_recommendations.txt"
+          content: "{{ out_turbo_recs.stdout | default('N/A') }}"
+
+    rescue:
+      - name: Log diagnostic capture failure
+        ansible.builtin.debug:
+          msg: "Failed to capture some diagnostics on {{ inventory_hostname }}"
+
+  - name: Verify Turbo test configuration file exists
+    ansible.builtin.stat:
+      path: "{{ turbo_test_config_path }}"
+    register: cfg_stat
+    failed_when: not cfg_stat.stat.exists
+    tags: verification
+
+  - name: Read Turbo test configuration
+    ansible.builtin.slurp:
+      src: "{{ turbo_test_config_path }}"
+    register: raw_cfg
+    when: cfg_stat.stat.exists
+
+  - name: Decode configuration content
+    ansible.builtin.set_fact:
+      turbo_cfg_content: "{{ raw_cfg.content | b64decode }}"
+    when: raw_cfg is defined
+
+  - name: Extract current max_concurrency value
+    ansible.builtin.set_fact:
+      current_max_concurrency: "{{ (turbo_cfg_content | regex_search('max_concurrency:\\s*(\\d+)', '\\1')) | int }}"
+    when: turbo_cfg_content is defined
+
+  - name: Log current max_concurrency
+    ansible.builtin.debug:
+      msg: "Current max_concurrency = {{ current_max_concurrency }}"
+
+  - name: Reduce max_concurrency to safe level (default 4)
+    ansible.builtin.lineinfile:
+      path: "{{ turbo_test_config_path }}"
+      regexp: '^(\s*max_concurrency:\s*)\d+'
+      line: '\1{{ [current_max_concurrency, 4] | min }}'
+      backup: yes
+    when: current_max_concurrency > 4
+    notify: Restart Turbo test service
+    tags: mitigation
+
+  - name: Find PID(s) of running Turbo test processes
+    ansible.builtin.shell: "pgrep -f '{{ turbo_test_service_name }}'"
+    register: turbo_pids
+    changed_when: false
+    ignore_errors: true
+
+  - name: Create cgroup for Turbo test
+    ansible.builtin.command: "cgcreate -g cpu:/{{ cgroup_name }}"
+    args:
+      creates: "/sys/fs/cgroup/cpu/{{ cgroup_name }}"
+    register: cg_create
+    ignore_errors: true
+
+  - name: Set CPU quota for Turbo test cgroup
+    ansible.builtin.command: "echo {{ cgroup_cpu_quota_us }} > /sys/fs/cgroup/cpu/{{ cgroup_name }}/cpu.cfs_quota_us"
+    when: cg_create.rc == 0
+
+  - name: Assign Turbo test PIDs to cgroup
+    ansible.builtin.shell: |
+      {% for pid in turbo_pids.stdout_lines %}
+      cgclassify -g cpu:/{{ cgroup_name }} {{ pid }}
+      {% endfor %}
+    when: turbo_pids.stdout != ""
+
+  - name: Boost I/O scheduler to deadline (if applicable)
+    ansible.builtin.shell: "echo deadline > /sys/block/{{ io_scheduler_device }}/queue/scheduler"
+    args:
+      warn: false
+    ignore_errors: true
+    tags: mitigation
+
+  - name: Cycle swap to clear swapped memory
+    ansible.builtin.shell: |
+      swapoff -a && swapon -a
+    args:
+      warn: false
+    ignore_errors: true
+    tags: mitigation
+
+  - block:
+      - name: Run mpstat for CPU saturation insight
+        ansible.builtin.shell: "{{ cmd_mpstat }}"
+        register: out_mpstat
+
+      - name: Save mpstat output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/mpstat.txt"
+          content: "{{ out_mpstat.stdout }}"
+
+      - name: Run numactl hardware view
+        ansible.builtin.shell: "{{ cmd_numactl }}"
+        register: out_numactl
+
+      - name: Save numactl output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/numactl.txt"
+          content: "{{ out_numactl.stdout }}"
+
+      - name: Retrieve current Turbonomic policies
+        ansible.builtin.shell: "{{ cmd_policies }}"
+        register: out_policies
+        ignore_errors: true
+
+      - name: Save policies output
+        ansible.builtin.copy:
+          dest: "{{ diag_dir.path }}/turbo_policies.txt"
+          content: "{{ out_policies.stdout | default('N/A') }}"
+
+    rescue:
+      - name: Log root-cause data collection issue
+        ansible.builtin.debug:
+          msg: "Root-cause data collection failed on {{ inventory_hostname }}"
+
+  - name: Adjust Turbonomic load threshold policy
+    ansible.builtin.shell: "turboctl update policy --host $(hostname) --load-threshold {{ load_threshold }}"
+    register: policy_update
+    ignore_errors: true
+    tags: long_term
+
+  - name: Schedule maintenance window to silence alerts during tests
+    ansible.builtin.shell: >
+      turboctl maintenance create
+      --host $(hostname)
+      --start "$(date -d '+5 minutes' +%Y-%m-%dT%H:%M:%S)"
+      --duration {{ maintenance_duration }}
+    register: maint_window
+    ignore_errors: true
+    tags: long_term
+
+  - name: Validate post‑remediation load stays below threshold
+    ansible.builtin.shell: "cat /proc/loadavg"
+    register: load_avg
+    changed_when: false
+
+  - name: Fail if load exceeds configured threshold
+    ansible.builtin.fail:
+      msg: "Load average {{ load_avg.stdout.split()[0] }} exceeds threshold {{ load_threshold }}"
+    when: load_avg.stdout.split()[0]|float > load_threshold
+
+  - name: Verify Turbonomic no longer reports high load
+    ansible.builtin.shell: "{{ cmd_events }}"
+    register: out_events
+    changed_when: false
+    ignore_errors: true
+
+  - name: Assemble remediation report
+    ansible.builtin.set_fact:
+      remediation_report: |
+        Host: {{ inventory_hostname }}
+        Date: {{ ansible_date_time.iso8601 }}
+        Current load average: {{ load_avg.stdout }}
+        Turbonomic high‑load events (last 60 min):
+        {{ out_events.stdout | default('Bhadri No events or query failed') }}
+
+  - name: Email remediation report
+    ansible.builtin.mail:
+      host: localhost
+      port: 25
+      to: "{{ email_recipient }}"
+      subject: "{{ email_subject }}"
+      body: "{{ remediation_report }}"
+    delegate_to: localhost
+    tags: notification
+
+  handlers:
+    - name: Restart Turbo test service
+      ansible.builtin.systemd:
+        name: "{{ turbo_test_service_name }}"
+        state: restarted
+        daemon_reload: yes
+      listen: Restart Turbo test service
