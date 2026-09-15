@@ -1,0 +1,106 @@
+- name: Manage Podman container memory consumption
+  hosts: podman_hosts
+  become: true
+  vars:
+    memory_threshold_mb: 500                     # Process RSS threshold in megabytes
+    desired_memory_limit: "1g"                   # Desired container memory limit
+    # Convert desired limit to bytes for numeric comparison
+    desired_memory_bytes: >-
+      {{
+        (desired_memory_limit[:-1]|int) *
+        {
+          'k': 1024,
+          'K': 1024,
+          'm': 1048576,
+          'M': 1048576,
+          'g': 1073741824,
+          'G': 1073741824
+        }[desired_memory_limit[-1]]
+      }}
+  tasks:
+    - name: Retrieve list of running Podman container IDs
+      ansible.builtin.command: podman ps -q
+      register: container_ids
+      changed_when: false
+
+    - name: Set container list fact
+      ansible.builtin.set_fact:
+        container_list: "{{ container_ids.stdout_lines }}"
+
+    - name: Gather per‑process memory usage via podman top
+      ansible.builtin.command: podman top {{ item }} -o pid,user,%mem,rss,command
+      register: top_results
+      changed_when: false
+      loop: "{{ container_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Identify containers with processes exceeding memory threshold
+      ansible.builtin.set_fact:
+        high_mem_containers: "{{ high_mem_containers | default([]) + [item.item] }}"
+      when: >-
+        (
+          item.stdout_lines[1:] |
+          map('split') |
+          map('last') |
+          map('int')
+        )
+        | select('gt', memory_threshold_mb * 1024) |
+        list |
+        length > 0
+      loop: "{{ top_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - block:
+        - name: Restart containers flagged for high memory usage
+          ansible.builtin.command: podman restart {{ item }}
+          register: restart_out
+          loop: "{{ high_mem_containers | default([]) }}"
+          loop_control:
+            label: "{{ item }}"
+
+      rescue:
+        - name: Report restart failures
+          ansible.builtin.debug:
+            msg: "Failed to restart container {{ item.item }} – {{ item.stderr }}"
+          loop: "{{ restart_out.results | default([]) }}"
+          when: item.failed
+
+      always:
+        - name: Verify containers are running after restart attempts
+          ansible.builtin.command: podman inspect --format='{{.State.Running}}' {{ item }}
+          register: verify_state
+          loop: "{{ high_mem_containers | default([]) }}"
+          changed_when: false
+
+        - name: Start containers that are not running
+          ansible.builtin.command: podman start {{ item.item }}
+          when: item.stdout != 'true'
+          loop: "{{ verify_state.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+    - name: Inspect current memory limits of all containers
+      ansible.builtin.command: podman inspect --format='{{.HostConfig.Memory}}' {{ item }}
+      register: mem_limits
+      changed_when: false
+      loop: "{{ container_list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Adjust containers with insufficient memory limits
+      ansible.builtin.command: podman update --memory={{ desired_memory_limit }} {{ item.item }}
+      when: (item.stdout | int) < desired_memory_bytes
+      loop: "{{ mem_limits.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Summarize actions taken
+      ansible.builtin.debug:
+        msg: |
+          Containers restarted due to high memory usage: {{ high_mem_containers | default([]) }}
+          Containers updated with new memory limit ({{ desired_memory_limit }}): {{ mem_limits.results
+            | selectattr('stdout','int','<',desired_memory_bytes)
+            | map(attribute='item')
+            | list }}
