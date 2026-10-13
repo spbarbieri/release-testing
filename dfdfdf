@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+#
+# Script: crio_kernel_cpu_check.sh
+# Purpose: Automate verification, data collection, offender identification,
+#          short‑term remediation and post‑remediation validation for
+#          Alert ID 308 – “CRI‑O container – CPU Kernel is ≥ 0.35 %”.
+#
+# Requirements:
+#   - kubectl, crictl, promtool, sar, jq installed and in PATH
+#   - Sufficient privileges to run systemctl, journalctl, and access /sys/fs/cgroup
+#
+# Usage:
+#   ./crio_kernel_cpu_check.sh -n <node-name> [-p <pod-name>] [--action collect|identify|remediate|validate]
+#
+# Example:
+#   ./crio_kernel_cpu_check.sh -n worker01 --action collect
+#
+
+set -euo pipefail
+
+###############################
+# Global defaults & helpers
+###############################
+
+SCRIPT_NAME="$(basename "$0")"
+TMP_DIR="/tmp/crio_kcpu_$$"
+mkdir -p "${TMP_DIR}"
+
+# Colors for pretty output
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+
+log() {
+    local lvl="$1"; shift
+    printf "%b[%s] %s%b\n" "$YELLOW" "$(date '+%Y-%m-%d %H:%M:%S')" "$lvl" "$NC" "$*"
+}
+die() {
+    log "${RED}ERROR${NC}" "$@"
+    exit 1
+}
+
+check_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found in PATH."
+}
+
+# Validate required external commands once
+for cmd in kubectl crictl systemctl journalctl dmesg top sar awk grep sed sort; do
+    check_cmd "$cmd"
+done
+
+###############################
+# Argument parsing
+###############################
+
+NODE=""
+POD_FILTER=""
+ACTION="all"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--node)
+            NODE="${2:?Missing node name}"
+            shift 2
+            ;;
+        -p|--pod)
+            POD_FILTER="${2}"
+            shift 2
+            ;;
+        --action)
+            ACTION="${2}"
+            shift 2
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: $SCRIPT_NAME -n <node-name> [-p <pod-name-filter>] [--action collect|identify|remediate|validate]
+
+If --action is omitted, the script runs the full workflow (all steps).
+EOF
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n "$NODE" ]] || die "Node name is mandatory. Use -n or --node."
+
+###############################
+# Helper functions
+###############################
+
+run_kubectl() {
+    kubectl "$@" --request-timeout=30s
+}
+
+verify_alert_active() {
+    log "INFO" "Verifying that Alert ID 308 is currently firing..."
+    # Adjust the query according to your Prometheus setup; using promtool as placeholder
+    if promtool query instant now -f "ALERTS{alertname=\"CRIOTaskKernelCPU\",instance=\"$NODE\"}" | grep -q "firing"; then
+        log "INFO" "Alert is ACTIVE."
+    else
+        log "WARN" "No active alert found for node $NODE. Continuing with diagnostics."
+    fi
+}
+
+check_node_health() {
+    log "INFO" "Fetching node overview..."
+    run_kubectl get nodes -o wide | grep -E "\b$NODE\b" || die "Node $NODE not found."
+
+    log "INFO" "Describing node $NODE..."
+    run_kubectl describe node "$NODE" >"${TMP_DIR}/node_describe.txt"
+}
+
+check_crio_service() {
+    log "INFO" "Checking CRI‑O service status..."
+    if systemctl is-active --quiet crio; then
+        systemctl status crio | head -n 10
+    else
+        die "CRIO service is NOT running on this host."
+    fi
+}
+
+check_rule_definition() {
+    log "INFO" "Ensuring alert rule threshold is 0.35 % ..."
+    if grep -R -E "CPU\s+Kernel.*0\.35%" /etc/prometheus/rules/*.yaml; then
+        log "INFO" "Rule definition appears correct."
+    else
+        log "WARN" "Could not locate expected threshold in rule files."
+    fi
+}
+
+collect_top_output() {
+    log "INFO" "Capturing real‑time CPU distribution for CRI‑O processes..."
+    local pids
+    pids=$(pgrep -d',' -x crio) || die "Failed to find CRI‑O process PID."
+    top -b -H -p "$pids" -n 1 >"${TMP_DIR}/top_cpu.txt"
+}
+
+collect_cgroup_stats() {
+    log "INFO" "Gathering cgroup cpu.stat for all CRI‑O containers..."
+    local cg_path="/sys/fs/cgroup/cpu/kubepods.slice"
+    mkdir -p "${TMP_DIR}/cgroup_stats"
+    shopt -s nullglob
+    for cg in "${cg_path}"/*; do
+        if [[ -f "${cg}/cpu.stat" ]]; then
+            cp "${cg}/cpu.stat" "${TMP_DIR}/cgroup_stats/$(basename "$cg").cpu.stat"
+        fi
+    done
+    shopt -u nullglob
+}
+
+list_containers() {
+    log "INFO" "Listing all containers (crictl)..."
+    crictl ps -a >"${TMP_DIR}/crictl_ps.txt"
+}
+
+inspect_pod() {
+    local pod_id="$1"
+    log "INFO" "Inspecting pod $pod_id ..."
+    crictl inspectp "$pod_id" >"${TMP_DIR}/pod_${pod_id}_inspect.json"
+}
+
+pull_crio_logs() {
+    log "INFO" "Pulling recent CRI‑O journal entries..."
+    journalctl -u crio -b -n 2000 >"${TMP_DIR}/crio_journal.log"
+}
+
+record_dmesg() {
+    log "INFO" "Recording last 100 lines of dmesg..."
+    dmesg | tail -n 100 >"${TMP_DIR}/dmesg_tail.txt"
+}
+
+snapshot_sar() {
+    log "INFO" "Running sar snapshot (1 sec × 60)…"
+    sar -P ALL 1 60 >"${TMP_DIR}/sar_snapshot_$(date +%s).txt"
+}
+
+identify_offenders() {
+    log "INFO" "Correlating kernel CPU usage with container IDs..."
+
+    declare -A kernel_usage
+    for stat_file in "${TMP_DIR}/cgroup_stats/"*.cpu.stat; do
+        # Extract container ID from filename (assuming format: <slice>.cpu.stat)
+        cid=$(basename "$stat_file" .cpu.stat)
+        ks=$(awk '/kernel/ {print $2}' "$stat_file")
+        [[ -z "$ks" ]] && ks=0
+        kernel_usage["$cid"]=$ks
+    done
+
+    # Build a sorted list (descending kernel ns)
+    {
+        for cid in "${!kernel_usage[@]}"; do
+            printf "%s %s\n" "$cid" "${kernel_usage[$cid]}"
+        done
+    } | sort -k2 -nr >"${TMP_DIR}/offender_rank.txt"
+
+    log "INFO" "Top offenders written to ${TMP_DIR}/offender_rank.txt"
+    column -t "${TMP_DIR}/offender_rank.txt" | head -n 20
+}
+
+remediate_container() {
+    local container_id="$1"
+    # Find associated pod name
+    local pod_line
+    pod_line=$(crictl ps -a | grep "$container_id" || true)
+    [[ -z "$pod_line" ]] && die "Cannot locate pod for container $container_id"
+
+    local pod_name namespace
+    read -r _ _ _ _ _ _ pod_name namespace _ <<<"$pod_line"
+
+    log "INFO" "Applying CPU limit (250m) to pod $pod_name in namespace $namespace ..."
+    kubectl patch pod "$pod_name" -n "$namespace" \
+        -p "{\"spec\":{\"containers\":[{\"name\":\"${container_id}\",\"resources\":{\"limits\":{\"cpu\":\"250m\"}}}]}}" \
+        || log "WARN" "Patch failed – you might need to adjust container name."
+
+    log "INFO" "Restarting pod $pod_name ..."
+    kubectl delete pod "$pod_name" -n "$namespace" --grace-period=0 --force
+
+    log "INFO" "Annotating pod with default seccomp profile ..."
+    kubectl annotate pod "$pod_name" -n "$namespace" \
+        io.kubernetes.cri-o.seccomp.profile=runtime/default --overwrite
+
+    log "INFO" "Cordoning node $NODE to stop new scheduling ..."
+    kubectl cordon "$NODE"
+}
+
+upgrade_crio() {
+    log "INFO" "Upgrading CRI‑O to latest available package..."
+    if command -v yum >/dev/null 2>&1; then
+        yum install -y cri-o
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y cri-o
+    else
+        die "Package manager not recognized (yum/apt-get). Manual upgrade required."
+    fi
+    systemctl daemon-reload
+    systemctl restart crio
+    log "INFO" "CRI‑O upgraded and restarted."
+}
+
+reduce_kernel_logging() {
+    log "INFO" "Reducing kernel printk level to minimise CPU spent on logging..."
+    sysctl -w kernel.printk="4 4 1 7"
+}
+
+validate_post_fix() {
+    log "INFO" "Re‑running top to verify kernel CPU drop..."
+    collect_top_output
+    grep -i "crio" "${TMP_DIR}/top_cpu.txt" | head -n 20
+
+    log "INFO" "Querying Prometheus to ensure alert cleared..."
+    if promtool query instant now -f "ALERTS{alertname=\"CRIOTaskKernelCPU\",instance=\"$NODE\"}" | grep -q "firing"; then
+        log "WARN" "Alert still firing!"
+    else
+        log "INFO" "Alert cleared."
+    fi
+}
+
+###############################
+# Main execution flow
+###############################
+
+case "$ACTION" in
+    all|collect)
+        verify_alert_active
+        check_node_health
+        check_crio_service
+        check_rule_definition
+        collect_top_output
+        collect_cgroup_stats
+        list_containers
+        pull_crio_logs
+        record_dmesg
+        snapshot_sar
+        ;&
+    identify)
+        identify_offenders
+        ;&
+    remediate)
+        # If a pod filter was supplied, attempt remediation on its top offender
+        if [[ -n "$POD_FILTER" ]]; then
+            # Find container IDs belonging to matching pods
+            mapfile -t matched_ids < <(crictl ps -a | grep "$POD_FILTER" | awk '{print $1}')
+            if (( ${#matched_ids[@]} == 0 )); then
+                die "No containers found matching pod filter '$POD_FILTER'."
+            fi
+            # Pick the highest kernel consumer among them
+            best_id=""
+            best_val=0
+            for cid in "${matched_ids[@]}"; do
+                ks=$(awk '/kernel/ {print $2}' "/sys/fs/cgroup/cpu/kubepods.slice/*/${cid}/cpu.stat" 2>/dev/null || echo 0)
+                if (( ks > best_val )); then
+                    best_val=$ks
+                    best_id=$cid
+                fi
+            done
+            [[ -z "$best_id" ]] && die "Unable to determine offending container."
+            remediate_container "$best_id"
+        else
+            log "WARN" "Pod filter not provided; skipping automated remediation."
+        fi
+        upgrade_crio
+        reduce_kernel_logging
+        ;&
+    validate)
+        validate_post_fix
+        ;;
+    *)
+        die "Invalid action: $ACTION. Choose from collect|identify|remediate|validate|all."
+        ;;
+esac
+
+log "INFO" "Script completed. All artefacts stored in $TMP_DIR"
+echo "=== Summary ==="
+ls -1 "${TMP_DIR}"
+exit 0
