@@ -1,0 +1,58 @@
+#!/bin/bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Script: remote_ls.sh
+# Description: SSH into a remote VM and execute 'ls -alh' in the
+#              user's home directory (or a specified directory).
+# ------------------------------------------------------------
+
+# Default values
+REMOTE_USER="${USER}"
+REMOTE_HOST=""
+IDENTITY_FILE=""
+REMOTE_DIR="~"
+
+print_usage() {
+    cat <<EOF
+Usage: ${0##*/} -h <host> [-u <user>] [-i <identity_file>] [-d <directory>]
+
+  -h <host>            Remote host (required)
+  -u <user>            Remote username (default: current user)
+  -i <identity_file>   SSH private key file (optional)
+  -d <directory>       Remote directory to list (default: home directory)
+  -?                   Show this help message
+EOF
+    exit 1
+}
+
+# Parse command‑line options
+while getopts ":h:u:i:d:?" opt; do
+    case "${opt}" in
+        h) REMOTE_HOST="${OPTARG}" ;;
+        u) REMOTE_USER="${OPTARG}" ;;
+        i) IDENTITY_FILE="${OPTARG}" ;;
+        d) REMOTE_DIR="${OPTARG}" ;;
+        \?) echo "Error: Invalid option -${OPTARG}" >&2; print_usage ;;
+        :)  echo "Error: Option -${OPTARG} requires an argument." >&2; print_usage ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "${REMOTE_HOST}" ]]; then
+    echo "Error: Remote host is required." >&2
+    print_usage
+fi
+
+# Build SSH command components
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+)
+
+if [[ -n "${IDENTITY_FILE}" ]]; then
+    SSH_OPTS+=( -i "${IDENTITY_FILE}" )
+fi
+
+# Execute remote command
+ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "ls -alh ${REMOTE_DIR}"
